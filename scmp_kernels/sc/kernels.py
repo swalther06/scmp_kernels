@@ -319,94 +319,97 @@ def enable_matmul_compact_dot_kernel(
 # =============================================================================
 
 @triton.jit
-def fused_quant_bipolar_kernel(
+def fused_quant_kernel(
     fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int16 output
-    sign_ptr,          # (rows, cols) int8 output
-    inv_scale,         # float: 1.0 / scale = q_max / abs_max
-    q_max,             # int: symmetric quantization bound (e.g. 127 for 8-bit)
-    max_rng_val,       # int: 2^sc_prec - 1
+    boundary_ptr,      # (rows, cols) int16 (bipolar) or int32 (unipolar) output
+    sign_ptr,          # (rows, cols) int8 — only written when IS_BIPOLAR
+    scale_ptr,         # (rows,) float32 — only written when PER_ROW and IS_BIPOLAR
+    row_sum_ptr,       # (rows,) float32 — only written when PER_ROW and not IS_BIPOLAR
+    inv_scale,         # float scalar — ignored when PER_ROW and IS_BIPOLAR (computed on-device)
+    zp,                # float scalar — only used when not IS_BIPOLAR
+    q_max,             # int: symmetric bound (bipolar) or asymmetric upper (unipolar)
+    max_rng_val,       # int: 2^sc_prec
     rows, cols,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,   # = BLOCK (flat path) or COLS_PAD (per-row path)
+    IS_BIPOLAR: tl.constexpr,
+    PER_ROW: tl.constexpr,
 ):
+    """Unified fused quant kernel covering 4 (mode × layout) variants.
+
+    Compile-time variants (caller picks via constexpr flags + grid shape):
+      • flat   + bipolar  → host inv_scale, writes (boundary int16, sign int8)
+      • per_row + bipolar → on-device scale, writes (boundary int16, sign int8, scale)
+      • flat   + unipolar → host inv_scale + zp, writes boundary int32
+      • per_row + unipolar → host inv_scale + zp, writes (boundary int32, row_sum)
+
+    Grid:
+      PER_ROW=True  → (rows,)                  BLOCK = COLS_PAD = next_power_of_2(cols)
+      PER_ROW=False → (cdiv(rows*cols, BLOCK),) BLOCK = 1024 (or chosen)
     """
-    Fused bipolar quantization: FP -> (boundary, sign) in one kernel.
-
-    For each element x:
-      x_int = round(clamp(x * inv_scale, -q_max, q_max))
-      sign = int8(sign(x_int))  (-1, 0, or 1)
-      boundary = int16(abs(x_int) * max_rng_val / q_max)
-    """
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    total = rows * cols
-    mask = offsets < total
-
-    x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
-
-    x_scaled = x * inv_scale
-    x_rounded = libdevice.nearbyint(x_scaled)
     q_max_f = q_max.to(tl.float32)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
 
-    sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
-                        tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
-                                 tl.full(x_clamped.shape, 0, dtype=tl.int8)))
+    if PER_ROW:
+        row = tl.program_id(0)
+        if row >= rows:
+            return
+        col_offsets = tl.arange(0, BLOCK)
+        mask = col_offsets < cols
+        base = row * cols
+        x = tl.load(fp_ptr + base + col_offsets, mask=mask, other=0.0)
 
-    mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
+        if IS_BIPOLAR:
+            # Per-row symmetric: compute scale on-device, write it.
+            abs_max = tl.max(tl.abs(x))
+            abs_max = tl.maximum(abs_max, 1e-5)
+            scale = abs_max / q_max
+            inv_scale_local = 1.0 / scale
+            tl.store(scale_ptr + row, scale)
+            x_scaled = x * inv_scale_local
+        else:
+            # Per-row unipolar: host-provided scale + zp, write row_sum for zp correction.
+            x_scaled = x * inv_scale + zp
+    else:
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        total = rows * cols
+        mask = offsets < total
+        base = 0  # offsets already absolute
+        col_offsets = offsets
+        x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
+        if IS_BIPOLAR:
+            x_scaled = x * inv_scale
+        else:
+            x_scaled = x * inv_scale + zp
 
-    tl.store(boundary_ptr + offsets, boundary, mask=mask)
-    tl.store(sign_ptr + offsets, sign_val, mask=mask)
-
-
-@triton.jit
-def fused_quant_bipolar_perrow_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int16 output
-    sign_ptr,          # (rows, cols) int8 output
-    scale_ptr,         # (rows,) float32 output — per-row scale for dequant
-    q_max,             # int: symmetric quantization bound (e.g. 127 for 8-bit)
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    COLS_PAD: tl.constexpr,
-):
-    """
-    Fused per-row bipolar quantization: FP -> (boundary, sign, scale) in one
-    kernel launch. One program per row.
-
-    Replaces _grouped_symmetric_quant + boundary computation (~20+ PyTorch ops)
-    with a single Triton kernel.
-    """
-    row = tl.program_id(0)
-    if row >= rows:
-        return
-
-    col_offsets = tl.arange(0, COLS_PAD)
-    mask = col_offsets < cols
-
-    x = tl.load(fp_ptr + row * cols + col_offsets, mask=mask, other=0.0)
-
-    abs_max = tl.max(tl.abs(x))
-    abs_max = tl.maximum(abs_max, 1e-5)
-    scale = abs_max / q_max
-    inv_scale = 1.0 / scale
-    tl.store(scale_ptr + row, scale)
-
-    x_scaled = x * inv_scale
     x_rounded = libdevice.nearbyint(x_scaled)
-    q_max_f = q_max.to(tl.float32)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
 
-    sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
-                        tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
-                                 tl.full(x_clamped.shape, 0, dtype=tl.int8)))
+    if IS_BIPOLAR:
+        x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
+        sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
+                            tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
+                                     tl.full(x_clamped.shape, 0, dtype=tl.int8)))
+        mag = tl.abs(x_clamped)
+        boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
+        if PER_ROW:
+            tl.store(boundary_ptr + base + col_offsets, boundary, mask=mask)
+            tl.store(sign_ptr + base + col_offsets, sign_val, mask=mask)
+        else:
+            tl.store(boundary_ptr + col_offsets, boundary, mask=mask)
+            tl.store(sign_ptr + col_offsets, sign_val, mask=mask)
+    else:
+        x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max_f)
+        boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
+        if PER_ROW:
+            tl.store(boundary_ptr + base + col_offsets, boundary, mask=mask)
+            row_sum = tl.sum(x_clamped, axis=0)
+            tl.store(row_sum_ptr + row, row_sum)
+        else:
+            tl.store(boundary_ptr + col_offsets, boundary, mask=mask)
 
-    mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
 
-    tl.store(boundary_ptr + row * cols + col_offsets, boundary, mask=mask)
-    tl.store(sign_ptr + row * cols + col_offsets, sign_val, mask=mask)
+# A single 1-element dummy tensor we can pass for unused output pointers.
+def _quant_dummy(device):
+    return torch.empty(1, dtype=torch.int8, device=device)
 
 
 def fused_quantize_bipolar_perrow(
@@ -414,16 +417,9 @@ def fused_quantize_bipolar_perrow(
     sc_prec: int,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fused per-row bipolar quantization in one kernel launch.
+    """Fused per-row bipolar quantization.
 
-    Matches _grouped_symmetric_quant(x, G=1, q_max) followed by
-    boundary = (|x_int| * max_rng_val / q_max).round().short().
-
-    Returns:
-        boundary: (rows, cols) int16
-        sign: (rows, cols) int8
-        scale_row: (rows,) float32 — per-row dequantization scale
+    Returns (boundary int16, sign int8, scale_row float32).
     """
     rows, cols = fp_tensor.shape
     q_max = 2 ** (sc_prec - 1) - 1
@@ -432,92 +428,16 @@ def fused_quantize_bipolar_perrow(
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
     sign = torch.empty(rows, cols, dtype=torch.int8, device=fp_tensor.device)
     scale_row = torch.empty(rows, dtype=torch.float32, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     COLS_PAD = triton.next_power_of_2(cols)
-    fused_quant_bipolar_perrow_kernel[(rows,)](
-        fp_tensor, boundary, sign, scale_row,
-        q_max, max_rng_val,
+    fused_quant_kernel[(rows,)](
+        fp_tensor, boundary, sign, scale_row, dummy,
+        0.0, 0.0, q_max, max_rng_val,
         rows, cols, COLS_PAD,
+        IS_BIPOLAR=True, PER_ROW=True,
     )
     return boundary, sign, scale_row
-
-
-@triton.jit
-def fused_quant_unipolar_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int32 output
-    inv_scale,         # float: 1.0 / scale
-    zp,                # float: zero-point
-    q_max,             # int: 2^sc_prec - 1
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    BLOCK: tl.constexpr,
-):
-    """
-    Fused unipolar quantization: FP -> boundary in one kernel.
-
-    For each element x:
-      x_int = round(clamp(x * inv_scale + zp, 0, q_max))
-      boundary = int(x_int * max_rng_val / q_max)
-    """
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    total = rows * cols
-    mask = offsets < total
-
-    x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
-
-    # Quantize
-    x_scaled = x * inv_scale + zp
-    x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max.to(tl.float32))
-
-    # Boundary
-    boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
-
-    tl.store(boundary_ptr + offsets, boundary, mask=mask)
-
-
-@triton.jit
-def fused_quant_unipolar_with_sum_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int32 output
-    row_sum_ptr,       # (rows,) float32 output — sum of x_int per row
-    inv_scale,         # float: 1.0 / scale
-    zp,                # float: zero-point
-    q_max,             # int: 2^sc_prec - 1
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    COLS_BLOCK: tl.constexpr,
-):
-    """
-    Fused unipolar quantization + per-row sum in one kernel.
-
-    Each program handles one row: quantize all cols, compute boundary,
-    and reduce the row's x_int sum for zero-point correction.
-    """
-    row = tl.program_id(0)
-    if row >= rows:
-        return
-
-    col_offsets = tl.arange(0, COLS_BLOCK)
-    col_mask = col_offsets < cols
-    base = row * cols
-
-    x = tl.load(fp_ptr + base + col_offsets, mask=col_mask, other=0.0)
-
-    # Quantize
-    x_scaled = x * inv_scale + zp
-    x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max.to(tl.float32))
-
-    # Boundary
-    boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
-    tl.store(boundary_ptr + base + col_offsets, boundary, mask=col_mask)
-
-    # Row sum of x_int (for zero-point correction)
-    row_sum = tl.sum(x_clamped, axis=0)
-    tl.store(row_sum_ptr + row, row_sum)
 
 
 def fused_quantize_bipolar(
@@ -526,14 +446,7 @@ def fused_quantize_bipolar(
     sc_prec: int,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """
-    Fused bipolar quantization: FP -> (boundary, sign) in one kernel launch.
-
-    Returns:
-        boundary: (rows, cols) int16
-        sign: (rows, cols) int8
-        scale: float (for dequantization)
-    """
+    """Fused per-tensor bipolar quantization. Returns (boundary int16, sign int8, scale)."""
     rows, cols = fp_tensor.shape
     q_max = 2 ** (sc_prec - 1) - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
@@ -543,14 +456,16 @@ def fused_quantize_bipolar(
 
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
     sign = torch.empty(rows, cols, dtype=torch.int8, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     total = rows * cols
     BLOCK = 1024
     grid = (triton.cdiv(total, BLOCK),)
-    fused_quant_bipolar_kernel[grid](
-        fp_tensor, boundary, sign,
-        inv_scale, q_max, max_rng_val,
+    fused_quant_kernel[grid](
+        fp_tensor, boundary, sign, dummy, dummy,
+        inv_scale, 0.0, q_max, max_rng_val,
         rows, cols, BLOCK,
+        IS_BIPOLAR=True, PER_ROW=False,
     )
     return boundary, sign, scale
 
@@ -563,15 +478,7 @@ def fused_quantize_unipolar(
     compute_sum: bool = False,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, float, float, float, torch.Tensor | None]:
-    """
-    Fused unipolar quantization: FP -> boundary in one kernel launch.
-
-    Returns:
-        boundary: (rows, cols) int32
-        scale: float
-        zp: float (zero-point)
-        row_sum: (rows,) float32 if compute_sum else None
-    """
+    """Fused unipolar quantization. Returns (boundary int32, scale, zp, row_sum-or-None)."""
     rows, cols = fp_tensor.shape
     q_max = 2 ** sc_prec - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
@@ -583,27 +490,27 @@ def fused_quantize_unipolar(
     zp_f = float(zp)
 
     boundary = torch.empty(rows, cols, dtype=torch.int32, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     if compute_sum:
-        # Use per-row kernel that also computes row sums
         row_sum = torch.empty(rows, dtype=torch.float32, device=fp_tensor.device)
-        # Round cols up to power of 2 for tl.arange
         COLS_BLOCK = triton.next_power_of_2(cols)
-        grid = (rows,)
-        fused_quant_unipolar_with_sum_kernel[grid](
-            fp_tensor, boundary, row_sum,
+        fused_quant_kernel[(rows,)](
+            fp_tensor, boundary, dummy, dummy, row_sum,
             inv_scale, zp_f, q_max, max_rng_val,
             rows, cols, COLS_BLOCK,
+            IS_BIPOLAR=False, PER_ROW=True,
         )
         return boundary, scale, zp_f, row_sum
     else:
         total = rows * cols
         BLOCK = 1024
         grid = (triton.cdiv(total, BLOCK),)
-        fused_quant_unipolar_kernel[grid](
-            fp_tensor, boundary,
+        fused_quant_kernel[grid](
+            fp_tensor, boundary, dummy, dummy, dummy,
             inv_scale, zp_f, q_max, max_rng_val,
             rows, cols, BLOCK,
+            IS_BIPOLAR=False, PER_ROW=False,
         )
         return boundary, scale, zp_f, None
 
