@@ -1434,22 +1434,14 @@ def _sc_matmul_per_tensor(
             stoc_len, rng_levels=max_rng_val)
         rng_b_for_compact = None
 
-    if mode == "bipolar":
-        result = _sc_matmul_enable_triton_bipolar(
-            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-            cum_indicator if not use_compact else None,
-            k_table, max_rng_val, N, D, M, stoc_len,
-            rng_b=rng_b_for_compact,
-        )
-    elif mode == "unipolar":
-        result = _sc_matmul_enable_triton_unipolar(
-            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-            cum_indicator if not use_compact else None,
-            k_table, max_rng_val, N, D, M, stoc_len,
-            rng_b=rng_b_for_compact,
-        )
-    else:
+    if mode not in ("bipolar", "unipolar"):
         raise ValueError(f"Unknown mode: {mode}")
+    result = _sc_matmul_enable_triton(
+        a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+        cum_indicator if not use_compact else None,
+        k_table, max_rng_val, N, D, M, stoc_len,
+        mode=mode, rng_b=rng_b_for_compact,
+    )
 
     if device.type != 'cuda':
         result = result.to(device)
@@ -1457,74 +1449,55 @@ def _sc_matmul_per_tensor(
     return result
 
 
-def _sc_matmul_enable_triton_bipolar(
+def _sc_matmul_enable_triton(
     a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
     cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+    *,
+    mode: str,
     rng_b=None,
 ):
-    """Bipolar enable-signal SC matmul via Triton (sign-magnitude)."""
-    q_max = 2 ** (sc_prec - 1) - 1
+    """Enable-signal SC matmul via Triton.
 
-    # Fused quantization: FP -> (boundary, sign) in one kernel each
-    abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
-    abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
-    boundary_a, sign_a, scale_a = fused_quantize_bipolar(
-        a, abs_max_a, sc_prec, rng_levels=max_rng_val
-    )
-    boundary_b, sign_b, scale_b = fused_quantize_bipolar(
-        b, abs_max_b, sc_prec, rng_levels=max_rng_val
-    )
-
-    q_max_sq = float(q_max * q_max)
+    ``mode="bipolar"`` uses sign-magnitude (quantize to ±q_max, multiply by
+    ±1 signs inside the kernel). ``mode="unipolar"`` uses asymmetric +
+    zero-point (quantize to [0, q_max], correct for zp on host).
+    """
+    is_bipolar = (mode == "bipolar")
+    if is_bipolar:
+        q_max = 2 ** (sc_prec - 1) - 1
+        q_max_sq = float(q_max * q_max)
+        abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
+        abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
+        boundary_a, sign_a, scale_a = fused_quantize_bipolar(
+            a, abs_max_a, sc_prec, rng_levels=max_rng_val)
+        boundary_b, sign_b, scale_b = fused_quantize_bipolar(
+            b, abs_max_b, sc_prec, rng_levels=max_rng_val)
+    else:
+        q_max_sq = float((2 ** sc_prec - 1) ** 2)
+        boundary_a, scale_a, zp_a_f, a_sum = fused_quantize_unipolar(
+            a, max_fp_a, min_fp_a, sc_prec,
+            compute_sum=True, rng_levels=max_rng_val)
+        boundary_b, scale_b, zp_b_f, b_sum = fused_quantize_unipolar(
+            b, max_fp_b, min_fp_b, sc_prec,
+            compute_sum=True, rng_levels=max_rng_val)
+        sign_a = sign_b = None
 
     if rng_b is not None:
         sc_raw = enable_matmul_compact(
             rng_b, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
     else:
         sc_raw = enable_matmul_triton(
             cum_indicator, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
+
+    if not is_bipolar:
+        # Zero-point correction (a_sum/b_sum already computed by fused kernel)
+        sc_raw = sc_raw + (-zp_b_f * a_sum[:, None]
+                          - zp_a_f * b_sum[None, :]
+                          + D * zp_a_f * zp_b_f)
 
     return sc_raw * (scale_a * scale_b)
-
-
-def _sc_matmul_enable_triton_unipolar(
-    a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-    cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-    rng_b=None,
-):
-    """Unipolar enable-signal SC matmul via Triton (asymmetric + zero-point)."""
-    q_max_sq = float((2 ** sc_prec - 1) ** 2)
-
-    # Fused quantization + row-sum in one kernel each
-    boundary_a, scale_a, zp_a_f, a_sum = fused_quantize_unipolar(
-        a, max_fp_a, min_fp_a, sc_prec,
-        compute_sum=True, rng_levels=max_rng_val)
-    boundary_b, scale_b, zp_b_f, b_sum = fused_quantize_unipolar(
-        b, max_fp_b, min_fp_b, sc_prec,
-        compute_sum=True, rng_levels=max_rng_val)
-
-    if rng_b is not None:
-        sc_raw = enable_matmul_compact(
-            rng_b, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-    else:
-        sc_raw = enable_matmul_triton(
-            cum_indicator, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-
-    # Zero-point correction (a_sum/b_sum already computed by fused kernel)
-    correction = (-zp_b_f * a_sum[:, None]
-                  - zp_a_f * b_sum[None, :]
-                  + D * zp_a_f * zp_b_f)
-    corrected = sc_raw + correction
-
-    return corrected * (scale_a * scale_b)
 
 
 def _sc_matmul_enable_triton_batched(
@@ -1953,48 +1926,27 @@ def _sc_matmul_per_row(
     cum_table_bytes = D * (stoc_len + 1) * V * 2
     use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
 
-    if mode == "bipolar":
-        # Bipolar grouped quantization path
-        if use_compact:
-            k_table = _get_cached_k_table(
-                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
-            )
-            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
-            result = _sc_matmul_bipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                None, k_table, max_rng_val, N, D, M, stoc_len,
-                rng_b=rng_b,
-            )
-        else:
-            cum_indicator, k_table = _get_cached_enable_tables(
-                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
-                stoc_len, rng_levels=max_rng_val)
-            result = _sc_matmul_bipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-            )
-    elif mode == "unipolar":
-        # Unipolar grouped quantization path
-        if use_compact:
-            k_table = _get_cached_k_table(
-                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
-            )
-            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
-            result = _sc_matmul_unipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                None, k_table, max_rng_val, N, D, M, stoc_len,
-                rng_b=rng_b,
-            )
-        else:
-            cum_indicator, k_table = _get_cached_enable_tables(
-                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
-                stoc_len, rng_levels=max_rng_val)
-            result = _sc_matmul_unipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-            )
-    else:
+    if mode not in ("bipolar", "unipolar"):
         raise ValueError(f"Unknown mode: {mode}")
+    if use_compact:
+        k_table = _get_cached_k_table(
+            config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
+        )
+        rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
+        result = _sc_matmul_grouped_enable(
+            a, b, group_a, group_b, sc_prec,
+            None, k_table, max_rng_val, N, D, M, stoc_len,
+            mode=mode, rng_b=rng_b,
+        )
+    else:
+        cum_indicator, k_table = _get_cached_enable_tables(
+            config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
+            stoc_len, rng_levels=max_rng_val)
+        result = _sc_matmul_grouped_enable(
+            a, b, group_a, group_b, sc_prec,
+            cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            mode=mode,
+        )
 
     if device.type != 'cuda':
         result = result.to(device)
@@ -2002,98 +1954,53 @@ def _sc_matmul_per_row(
     return result
 
 
-def _sc_matmul_bipolar_grouped_enable(
+def _sc_matmul_grouped_enable(
     a, b, group_a, group_b, sc_prec,
     cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+    *,
+    mode: str,
     rng_b=None,
 ):
-    """Bipolar enable-signal SC matmul with per-row-group quantization.
+    """Enable-signal SC matmul with per-row-group quantization.
 
-    Uses _grouped_symmetric_quant for host-side quantization,
-    then enable-signal table-lookup kernel with sign handling.
+    Bipolar: symmetric quant via _grouped_symmetric_quant → sign-magnitude SC.
+    Unipolar: asymmetric quant via _grouped_asymmetric_quant → zp correction.
+    Both share the same enable-signal matmul kernel suite.
     """
-    q_max = 2 ** (sc_prec - 1) - 1
-
-    # Per-row-group symmetric quantization
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
-
-    # Compute boundaries for enable-signal lookup
-    abs_a_int = a_int.abs()
-    abs_b_int = b_int.abs()
-    boundary_a = (abs_a_int * max_rng_val / q_max).round().short()  # (N, D)
-    boundary_b = (abs_b_int * max_rng_val / q_max).round().short()  # (M, D)
+    is_bipolar = (mode == "bipolar")
+    if is_bipolar:
+        q_max = 2 ** (sc_prec - 1) - 1
+        scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
+        scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
+        boundary_a = (a_int.abs() * max_rng_val / q_max).round().short()
+        boundary_b = (b_int.abs() * max_rng_val / q_max).round().short()
+    else:
+        q_max = 2 ** sc_prec - 1
+        scale_a_row, zp_a_row, a_int = _grouped_asymmetric_quant(a, group_a, q_max)
+        scale_b_row, zp_b_row, b_int = _grouped_asymmetric_quant(b, group_b, q_max)
+        boundary_a = (a_int * max_rng_val / q_max).round().short()
+        boundary_b = (b_int * max_rng_val / q_max).round().short()
+        sign_a = sign_b = None
 
     q_max_sq = float(q_max * q_max)
-
-    # Enable-signal matmul with sign handling (bipolar)
     if rng_b is not None:
         sc_raw = enable_matmul_compact(
             rng_b, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
     else:
         sc_raw = enable_matmul_triton(
             cum_indicator, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
 
-    # Per-element dequantization (no zero-point correction needed for symmetric)
-    result_fp = sc_raw * (scale_a_row[:, None] * scale_b_row[None, :])
+    if not is_bipolar:
+        # Per-element zero-point correction
+        a_sum = a_int.sum(dim=1)
+        b_sum = b_int.sum(dim=1)
+        sc_raw = sc_raw + (-zp_b_row[None, :] * a_sum[:, None]
+                          - zp_a_row[:, None] * b_sum[None, :]
+                          + D * zp_a_row[:, None] * zp_b_row[None, :])
 
-    return result_fp
-
-
-def _sc_matmul_unipolar_grouped_enable(
-    a, b, group_a, group_b, sc_prec,
-    cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-    rng_b=None,
-):
-    """
-    Unipolar enable-signal SC matmul with per-row-group quantization.
-
-    Uses _grouped_asymmetric_quant for host-side quantization (same as standard),
-    then enable-signal table-lookup kernel instead of packed AND matmul.
-    """
-    q_max = 2 ** sc_prec - 1
-
-    # Per-row-group asymmetric quantization (reuse existing helper)
-    scale_a_row, zp_a_row, a_int = _grouped_asymmetric_quant(a, group_a, q_max)
-    scale_b_row, zp_b_row, b_int = _grouped_asymmetric_quant(b, group_b, q_max)
-
-    # Compute boundaries for enable-signal lookup
-    boundary_a = (a_int * max_rng_val / q_max).round().short()  # (N, D)
-    boundary_b = (b_int * max_rng_val / q_max).round().short()  # (M, D)
-
-    q_max_sq = float(q_max * q_max)
-
-    # Enable-signal matmul: compact or table-based
-    if rng_b is not None:
-        sc_raw = enable_matmul_compact(
-            rng_b, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-    else:
-        sc_raw = enable_matmul_triton(
-            cum_indicator, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-
-    # Per-element zero-point correction (same as standard grouped)
-    a_sum = a_int.sum(dim=1)   # (N,)
-    b_sum = b_int.sum(dim=1)   # (M,)
-
-    correction = (
-        -zp_b_row[None, :] * a_sum[:, None]
-        - zp_a_row[:, None] * b_sum[None, :]
-        + D * zp_a_row[:, None] * zp_b_row[None, :]
-    )
-    corrected = sc_raw + correction
-
-    # Per-element dequantization
-    result_fp = corrected * (scale_a_row[:, None] * scale_b_row[None, :])
-
-    return result_fp
+    return sc_raw * (scale_a_row[:, None] * scale_b_row[None, :])
 
 
 def _grouped_symmetric_quant(x, G, q_max):
