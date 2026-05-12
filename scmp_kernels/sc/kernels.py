@@ -2893,3 +2893,232 @@ def _sc_matmul_per_row_batched(
 
     output.mul_(scale_a_row.unsqueeze(2) * scale_b_row.unsqueeze(1))
     return output
+
+
+# =============================================================================
+# Public flat-API surface — compatibility names used by application code
+# (Q-DiT and similar). Most are direct aliases for private helpers whose
+# signatures already match the historical sc_triton public API.
+# =============================================================================
+
+
+@torch.no_grad()
+def sc_matmul_enable_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_fp_a: float,
+    min_fp_a: float,
+    max_fp_b: float = None,
+    min_fp_b: float = None,
+    mode: str = "bipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+    stoc_len: Optional[int] = None,
+    rng_levels: Optional[int] = None,
+) -> torch.Tensor:
+    """Enable-signal SC matmul ``a @ b.T`` (2D/3D auto-detected).
+
+    Pipeline: quantize → build (or fetch cached) enable tables → matmul → dequantize.
+    Dispatches by ``mode`` to bipolar/unipolar private helpers; the 3D shape is
+    delegated to ``_sc_matmul_enable_triton_batched``.
+    """
+    if stoc_len is None:
+        stoc_len = 2 ** sc_prec
+    if max_fp_b is None:
+        max_fp_b = max_fp_a
+    if min_fp_b is None:
+        min_fp_b = min_fp_a
+
+    if a.dim() == 3:
+        return _sc_matmul_enable_triton_batched(
+            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b,
+            mode, sc_prec, config, stoc_len=stoc_len, rng_levels=rng_levels,
+        )
+
+    assert a.dim() == 2 and b.dim() == 2, f"Expected 2D, got a:{a.dim()}D b:{b.dim()}D"
+    assert a.shape[1] == b.shape[1], f"Dim mismatch: a={a.shape[1]}, b={b.shape[1]}"
+
+    N, D = a.shape
+    M = b.shape[0]
+    max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
+
+    if config is None:
+        from .config_helpers import make_sobol_simple_config
+        config = make_sobol_simple_config(D, D, sc_prec)
+
+    device = a.device
+    if device.type != 'cuda':
+        a = a.cuda()
+        b = b.cuda()
+    a = a.float()
+    b = b.float()
+
+    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
+
+    V = max_rng_val + 1
+    cum_table_bytes = D * (stoc_len + 1) * V * 2  # int16
+    use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
+
+    if use_compact:
+        k_table = _get_cached_k_table(
+            config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val,
+        )
+        rng_b_for_compact = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
+        cum_indicator = None
+    else:
+        cum_indicator, k_table = _get_cached_enable_tables(
+            config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
+            stoc_len, rng_levels=max_rng_val,
+        )
+        rng_b_for_compact = None
+
+    if mode == "bipolar":
+        result = _sc_matmul_enable_triton_bipolar(
+            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+            cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            rng_b=rng_b_for_compact,
+        )
+    elif mode == "unipolar":
+        result = _sc_matmul_enable_triton_unipolar(
+            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+            cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            rng_b=rng_b_for_compact,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    if device.type != 'cuda':
+        result = result.to(device)
+    return result
+
+
+@torch.no_grad()
+def sc_matmul_grouped_enable_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_a: int = 1,
+    group_b: int = 1,
+    mode: str = "unipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+    stoc_len: Optional[int] = None,
+    rng_levels: Optional[int] = None,
+) -> torch.Tensor:
+    """Enable-signal SC matmul with per-row-group quantization (2D only)."""
+    if stoc_len is None:
+        stoc_len = 2 ** sc_prec
+
+    assert a.dim() == 2 and b.dim() == 2, f"Expected 2D, got a:{a.dim()}D b:{b.dim()}D"
+    assert a.shape[1] == b.shape[1], f"Inner dim mismatch: {a.shape[1]} vs {b.shape[1]}"
+
+    N, D = a.shape
+    M = b.shape[0]
+    max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
+
+    if config is None:
+        from .config_helpers import make_sobol_simple_config
+        config = make_sobol_simple_config(D, D, sc_prec)
+
+    device = a.device
+    if device.type != 'cuda':
+        a = a.cuda()
+        b = b.cuda()
+    a = a.float()
+    b = b.float()
+
+    rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, a.device)
+
+    V = max_rng_val + 1
+    cum_table_bytes = D * (stoc_len + 1) * V * 2
+    use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
+
+    if mode == "bipolar":
+        if use_compact:
+            k_table = _get_cached_k_table(
+                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val,
+            )
+            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
+            result = _sc_matmul_bipolar_grouped_enable(
+                a, b, group_a, group_b, sc_prec,
+                None, k_table, max_rng_val, N, D, M, stoc_len,
+                rng_b=rng_b,
+            )
+        else:
+            cum_indicator, k_table = _get_cached_enable_tables(
+                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
+                stoc_len, rng_levels=max_rng_val,
+            )
+            result = _sc_matmul_bipolar_grouped_enable(
+                a, b, group_a, group_b, sc_prec,
+                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            )
+    elif mode == "unipolar":
+        if use_compact:
+            k_table = _get_cached_k_table(
+                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val,
+            )
+            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
+            result = _sc_matmul_unipolar_grouped_enable(
+                a, b, group_a, group_b, sc_prec,
+                None, k_table, max_rng_val, N, D, M, stoc_len,
+                rng_b=rng_b,
+            )
+        else:
+            cum_indicator, k_table = _get_cached_enable_tables(
+                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
+                stoc_len, rng_levels=max_rng_val,
+            )
+            result = _sc_matmul_unipolar_grouped_enable(
+                a, b, group_a, group_b, sc_prec,
+                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    if device.type != 'cuda':
+        result = result.to(device)
+    return result
+
+
+@torch.no_grad()
+def sc_matmul_mlp(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    max_fp_a: float = 0.0,
+    min_fp_a: float = 0.0,
+    max_fp_b: float = None,
+    min_fp_b: float = None,
+    mode: str = "bipolar",
+    sc_prec: int = 8,
+    config: Optional[dict] = None,
+    group_a: int = 1,
+    group_b: int = 1,
+    chunk_d: int = 0,
+    stoc_len: Optional[int] = None,
+    rng_levels: Optional[int] = None,
+) -> torch.Tensor:
+    """Non-enable MLP matmul (legacy sc_triton.sc_matmul_mlp compat).
+
+    Delegates to per-tensor sc_matmul; ``group_a``/``group_b``/``chunk_d``/
+    ``rng_levels`` are accepted for API parity but unused on the non-enable
+    path (they only affect the enable-signal variant).
+    """
+    if max_fp_a == 0.0:
+        max_fp_a = a.max().item()
+    if min_fp_a == 0.0:
+        min_fp_a = a.min().item()
+    if max_fp_b is None:
+        max_fp_b = b.max().item()
+    if min_fp_b is None:
+        min_fp_b = b.min().item()
+    return _sc_matmul_per_tensor(
+        a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b,
+        mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+    )
+
+
+# --- Tier-3 one-line aliases (signatures already match) --------------------
+sc_matmul_per_tensor             = _sc_matmul_per_tensor
+sc_matmul_grouped                = _sc_matmul_per_row
+sc_matmul_enable_batched_bipolar = _sc_matmul_per_head_bipolar
+sc_matmul_enable_triton_mlp      = _sc_matmul_per_row_mlp
