@@ -666,7 +666,7 @@ def enable_matmul_bipolar_batched_kernel(
 
 def _sc_matmul_per_head_bipolar(
     q_flat: torch.Tensor,       # (BH, N, D) float32
-    k_flat: torch.Tensor,       # (BH, N, D) float32
+    k_flat: torch.Tensor,       # (BH, M, D) float32
     q_maxs: torch.Tensor,       # (BH,) float32 — per-head max
     q_mins: torch.Tensor,       # (BH,) float32 — per-head min
     k_maxs: torch.Tensor,       # (BH,) float32
@@ -684,14 +684,15 @@ def _sc_matmul_per_head_bipolar(
     2. enable_matmul_bipolar_batched_kernel
 
     Args:
-        q_flat, k_flat: (BH, N, D) float32 tensors
+        q_flat: (BH, N, D) float32
+        k_flat: (BH, M, D) float32 — M may differ from N (e.g. softmax·V).
         q_maxs, q_mins, k_maxs, k_mins: (BH,) per-head ranges
         sc_prec: SC precision
         config: SC RNG config dict
         stoc_len: Stochastic stream length. If None, uses 2^sc_prec.
 
     Returns:
-        output: (BH, N, N) float32
+        output: (BH, N, M) float32
     """
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
@@ -699,7 +700,12 @@ def _sc_matmul_per_head_bipolar(
     q_flat = q_flat.contiguous()
     k_flat = k_flat.contiguous()
     BH, N, D = q_flat.shape
-    M = N  # QK matmul: N x N
+    BH_k, M, D_k = k_flat.shape
+    if BH_k != BH or D_k != D:
+        raise ValueError(
+            f"_sc_matmul_per_head_bipolar: shape mismatch — q is (BH={BH}, N={N}, D={D}), "
+            f"k is (BH={BH_k}, M={M}, D={D_k}); require equal BH and D."
+        )
     device = q_flat.device
 
     q_max = 2 ** (sc_prec - 1) - 1
@@ -716,21 +722,24 @@ def _sc_matmul_per_head_bipolar(
     inv_scale_k = 1.0 / scale_k  # (BH,)
 
     # --- Batched fused quantization (writes directly in transposed (BH, D, N/M) layout) ---
-    slice_size = N * D
+    # Slice sizes differ when N != M (e.g. softmax·V where a is (BH,N,D) and b is (BH,M,D)).
+    slice_size_q = N * D
+    slice_size_k = M * D
     boundary_q = torch.empty(BH, D, N, dtype=torch.int16, device=device)
     sign_q = torch.empty(BH, D, N, dtype=torch.int8, device=device)
     boundary_k = torch.empty(BH, D, M, dtype=torch.int16, device=device)
     sign_k = torch.empty(BH, D, M, dtype=torch.int8, device=device)
 
     BLOCK = 1024
-    grid_quant = (triton.cdiv(slice_size, BLOCK), BH)
-    fused_quant_bipolar_batched_kernel[grid_quant](
+    grid_quant_q = (triton.cdiv(slice_size_q, BLOCK), BH)
+    grid_quant_k = (triton.cdiv(slice_size_k, BLOCK), BH)
+    fused_quant_bipolar_batched_kernel[grid_quant_q](
         q_flat, boundary_q, sign_q, inv_scale_q,
-        q_max, q_min, max_rng_val, slice_size, N, D, BLOCK,
+        q_max, q_min, max_rng_val, slice_size_q, N, D, BLOCK,
     )
-    fused_quant_bipolar_batched_kernel[grid_quant](
+    fused_quant_bipolar_batched_kernel[grid_quant_k](
         k_flat, boundary_k, sign_k, inv_scale_k,
-        q_max, q_min, max_rng_val, slice_size, M, D, BLOCK,
+        q_max, q_min, max_rng_val, slice_size_k, M, D, BLOCK,
     )
 
     # --- Get cached tables (shared across all heads) ---

@@ -86,7 +86,7 @@ def sc_matmul(
 
     Returns:
         Output tensor. 2D inputs → ``(N, M)`` float32. 3D inputs → ``(BH, N, M)``
-        float32 (``(BH, M, N)`` for ``per_head``).
+        float32 (same shape for all granularities, including ``per_head``).
 
     Raises:
         ValueError: if ``chunk_d > 0`` is combined with anything other than
