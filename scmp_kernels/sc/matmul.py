@@ -164,7 +164,7 @@ def sc_matmul(
                 a, b,
                 group_a=group_a, group_b=group_b,
                 mode=mode, sc_prec=sc_prec, config=config,
-                stoc_len=stoc_len,
+                stoc_len=stoc_len, rng_levels=rng_levels,
             )
         return _sc_matmul_per_row(
             a, b,

@@ -2134,6 +2134,7 @@ def _sc_matmul_per_row_batched(
     sc_prec: int = 8,
     config: Optional[dict] = None,
     stoc_len: Optional[int] = None,
+    rng_levels: Optional[int] = None,
 ) -> torch.Tensor:
     """Batched 3D version of ``_sc_matmul_per_row``: ``a @ b^T``
     over a leading batch dim, in one kernel launch.
@@ -2174,6 +2175,7 @@ def _sc_matmul_per_row_batched(
                 a[i].contiguous(), b[i].contiguous(),
                 group_a=group_a, group_b=group_b,
                 mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+                rng_levels=rng_levels,
             )
         return out
     if mode != "bipolar":
@@ -2183,7 +2185,8 @@ def _sc_matmul_per_row_batched(
     b = b.float().contiguous()
 
     rand_seqs_a_t, rand_seqs_b_t = _get_cached_sequences(config, sc_prec, device)
-    V = 2 ** sc_prec + 1
+    max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
+    V = max_rng_val + 1
     cum_table_bytes = D * (stoc_len + 1) * V * 2
     use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
 
@@ -2195,11 +2198,11 @@ def _sc_matmul_per_row_batched(
                 a[i], b[i],
                 group_a=group_a, group_b=group_b,
                 mode=mode, sc_prec=sc_prec, config=config, stoc_len=stoc_len,
+                rng_levels=rng_levels,
             )
         return out
 
     q_max = 2 ** (sc_prec - 1) - 1
-    max_rng_val = 2 ** sc_prec
     q_max_sq = float(q_max * q_max)
 
     scale_a_row, a_int, sign_a = _grouped_symmetric_quant_batched(
@@ -2216,7 +2219,8 @@ def _sc_matmul_per_row_batched(
     sign_b_t = sign_b.transpose(1, 2).contiguous()
 
     cum_indicator, k_table = _get_cached_enable_tables(
-        config, sc_prec, device, rand_seqs_a_t, rand_seqs_b_t, stoc_len)
+        config, sc_prec, device, rand_seqs_a_t, rand_seqs_b_t, stoc_len,
+        rng_levels=rng_levels)
     V_actual = cum_indicator.shape[2]
 
     head_scale_ones = torch.ones(BH, dtype=torch.float32, device=device)
