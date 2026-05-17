@@ -15,6 +15,7 @@ Supports all config types:
 """
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -410,7 +411,10 @@ def fused_quant_kernel(
 
 
 # A single 1-element dummy tensor we can pass for unused output pointers.
-def _quant_dummy(device):
+# Cached per-device so we don't pay an allocator hit on every kernel launch.
+# maxsize=8 covers up to 8 GPUs + CPU; cache lives for the process lifetime.
+@functools.lru_cache(maxsize=8)
+def _quant_dummy(device: torch.device) -> torch.Tensor:
     return torch.empty(1, dtype=torch.int8, device=device)
 
 
@@ -1056,8 +1060,7 @@ def enable_matmul_triton(
     nw = 8 if BLOCK_M == 32 else 2
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
     if not is_bipolar:
-        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
-        sign_a = sign_b = _dummy_sign
+        sign_a = sign_b = _quant_dummy(output.device)
     enable_matmul_tiled_kernel[grid](
         cum_indicator, k_table,
         boundary_a, boundary_b,
@@ -1141,8 +1144,7 @@ def enable_matmul_compact(
     # Unipolar path doesn't read sign pointers (constexpr-branched out).
     # Pass dummy 1-element int8 tensors; they're never dereferenced inside.
     if not is_bipolar:
-        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
-        sign_a = sign_b = _dummy_sign
+        sign_a = sign_b = _quant_dummy(output.device)
     enable_matmul_compact_dot_kernel[grid](
         rng_b, k_table,
         boundary_a, boundary_b,
@@ -1238,7 +1240,7 @@ def enable_matmul_compact_mlp(
             sa_chunk = sign_a[:, d_start:d_end].t().contiguous()
             sb_chunk = sign_b[:, d_start:d_end].t().contiguous()
         else:
-            sa_chunk = sb_chunk = torch.empty(1, dtype=torch.int8, device=partial.device)
+            sa_chunk = sb_chunk = _quant_dummy(partial.device)
         enable_matmul_tiled_kernel[grid_mm](
             cum_chunk, k_tab_chunk,
             ba_chunk, bb_chunk,
