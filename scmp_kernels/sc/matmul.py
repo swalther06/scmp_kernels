@@ -45,6 +45,7 @@ def sc_matmul(
     group_b: int = 1,
     rng_levels: Optional[int] = None,
     config: Optional[dict] = None,
+    halve_bipolar_stoc_len: bool = False,
 ) -> torch.Tensor:
     """Stochastic-computing matmul ``a @ b.T``.
 
@@ -83,6 +84,15 @@ def sc_matmul(
             specific integer to keep an int8 quant grid while varying
             ``stoc_len``.
         config: optional Sobol RNG/SNG config dict. Auto-built when ``None``.
+        halve_bipolar_stoc_len: enable the uSystolic / HUB sign-magnitude
+            cycle-halving optimization from wu-hpca2022. Bipolar magnitudes
+            only carry ``sc_prec - 1`` bits of information, so a stream and
+            RNG grid of size ``2 ** (sc_prec - 1)`` are sufficient. When
+            ``True`` and ``mode == "bipolar"``, any ``stoc_len`` /
+            ``rng_levels`` left at ``None`` are overridden to
+            ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid).
+            Has no effect when ``mode == "unipolar"``. Default ``False``
+            preserves legacy behavior.
 
     Returns:
         Output tensor. 2D inputs → ``(N, M)`` float32. 3D inputs → ``(BH, N, M)``
@@ -103,6 +113,17 @@ def sc_matmul(
         raise ValueError(
             f"sc_matmul: unknown mode '{mode}'. "
             f"Expected one of {_VALID_MODES}.")
+
+    # ---- uSystolic / HUB sign-magnitude cycle-halving (wu-hpca2022) ----------
+    # Bipolar mode is already sign-magnitude with q_max = 2^(sc_prec-1) - 1,
+    # so the magnitude only spans 2^(sc_prec-1) levels. The default
+    # stoc_len = 2^sc_prec therefore wastes ~2× cycles for no resolution gain.
+    if halve_bipolar_stoc_len and mode == "bipolar":
+        halved = 2 ** (sc_prec - 1)
+        if stoc_len is None:
+            stoc_len = halved
+        if rng_levels is None:
+            rng_levels = halved
 
     # ---- chunk_d compatibility gate -----------------------------------------
     # Currently chunk_d is only implemented in the per-row + bipolar MLP
@@ -148,7 +169,7 @@ def sc_matmul(
             max_fp_a=a_max, min_fp_a=a_min,
             max_fp_b=b_max, min_fp_b=b_min,
             mode=mode, sc_prec=sc_prec,
-            stoc_len=stoc_len, config=config,
+            stoc_len=stoc_len, rng_levels=rng_levels, config=config,
         )
 
     if granularity == "per_row":
