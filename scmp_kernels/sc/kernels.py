@@ -688,6 +688,15 @@ def _prepare_rng_prefix(
             return _owen_scramble(prefix, base_levels)
         return prefix
 
+    # Experimental (gated, default off): decorrelate the per-dim trajectory
+    # BEFORE rescaling onto the coarser grid. The rescale path (e.g.
+    # halve_bipolar_stoc_len, which forces grid_levels=2^(sc_prec-1)) otherwise
+    # never scrambles, so every dim shares one Sobol joint trajectory and SC
+    # error accumulates across D instead of averaging — catastrophic at short
+    # stoc_len. XOR is a bijection on [0, base_levels), so marginals (and the
+    # rescaled grid) are unchanged. SC_OWEN_MODE selects the family.
+    if os.environ.get("SC_SCRAMBLE_RESCALE", "0") == "1":
+        prefix = _owen_scramble(prefix, base_levels)
     prefix_i64 = prefix.to(torch.int64)
     scaled = torch.div(prefix_i64 * grid_levels, base_levels, rounding_mode="floor")
     return scaled.to(prefix.dtype).contiguous()
