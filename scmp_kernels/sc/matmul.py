@@ -14,6 +14,7 @@ behind an explicit ``a_observer=`` kwarg if ever needed.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional
 
 import torch
@@ -32,6 +33,27 @@ _VALID_GRANULARITIES = ("per_tensor", "per_row", "per_head")
 _VALID_MODES = ("bipolar", "unipolar")
 
 
+def _pin_to_operand_device(fn):
+    """Run the SC matmul on the operands' CUDA device.
+
+    Triton kernel launches and scratch-tensor allocations target the *current*
+    CUDA device, not the device the operands live on. When ``sc_matmul`` is
+    called with inputs on a non-default GPU — e.g. a layer placed on ``cuda:1``
+    by ``device_map="auto"`` — kernels would otherwise launch on ``cuda:0``,
+    causing an illegal cross-device access (chunked MLP path) or silently wrong
+    results (other paths). Pin the current device to ``a.device`` for the call;
+    the previous device is restored on exit.
+    """
+    @functools.wraps(fn)
+    def wrapper(a, b, *args, **kwargs):
+        if a.is_cuda:
+            with torch.cuda.device(a.device):
+                return fn(a, b, *args, **kwargs)
+        return fn(a, b, *args, **kwargs)
+    return wrapper
+
+
+@_pin_to_operand_device
 @torch.no_grad()
 def sc_matmul(
     a: torch.Tensor,
