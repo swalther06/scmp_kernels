@@ -1,0 +1,3 @@
+# captured operand tensors (regenerate via capture_real_tensors.py) and run logs
+*.pt
+_run_*.out
