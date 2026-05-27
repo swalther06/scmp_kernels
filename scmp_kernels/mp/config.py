@@ -9,6 +9,8 @@ Includes:
 - MPConfig: Fixed-fraction quantile-based assignment (original).
 - AdaptiveMPConfig: Timestep-adaptive thresholds with per-operator and
   per-layer control, inspired by HPCA APT's APDT algorithm.
+- FreeBoundaryMPConfig: Zero-hyperparameter per-(block, op) free boundaries
+  (k-1 for k levels), filled in by an offline oracle search.
 """
 from __future__ import annotations
 
@@ -18,6 +20,22 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------
+# Per-block context: classifiers that index by (block, op) read this
+# global; the auto-calibrator and runtime pre-hooks set it per forward.
+# ---------------------------------------------------------------------
+_CURRENT_BLOCK_IDX: int = 0
+
+
+def set_current_block_idx(i: int) -> None:
+    global _CURRENT_BLOCK_IDX
+    _CURRENT_BLOCK_IDX = int(i)
+
+
+def get_current_block_idx() -> int:
+    return _CURRENT_BLOCK_IDX
 
 
 @dataclass
@@ -211,6 +229,10 @@ class AdaptiveMPConfig:
     layer_buckets: int = 1
     operator_default_thresholds: dict[str, list[float]] = field(default_factory=dict)
     bucket_thresholds: dict[tuple[str, int, int], list[float]] = field(default_factory=dict)
+    # When set, bypass the linear-threshold classifier and use these fractions
+    # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
+    # Length must match stoc_len_levels; sums to 1.
+    target_fractions: Optional[list[float]] = None
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -223,6 +245,13 @@ class AdaptiveMPConfig:
             self.stoc_len_levels = [s for s in self.stoc_len_levels if s > 0]
         if self.threshold_table_path:
             self.load_threshold_table(self.threshold_table_path)
+        if self.target_fractions is not None:
+            assert len(self.target_fractions) == len(self.stoc_len_levels), (
+                f"target_fractions length {len(self.target_fractions)} "
+                f"must match stoc_len_levels length {len(self.stoc_len_levels)}")
+            s = sum(self.target_fractions)
+            assert abs(s - 1.0) < 1e-6, (
+                f"target_fractions must sum to 1.0, got {s}")
 
     def get_params(self, operator: Optional[str] = None) -> tuple[float, float]:
         """Get (alpha, beta) for an operator, falling back to global."""
@@ -312,6 +341,36 @@ def adaptive_classify_rows(
     levels = config.stoc_len_levels
     n_levels = len(levels)
 
+    # ---------- Free-boundary path (FreeBoundaryMPConfig) ----------
+    # Per-(block, op) learned boundaries; no alpha/beta/progress dependency.
+    # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
+    # dispatch still works elsewhere while we dispatch correctly here.
+    if isinstance(config, FreeBoundaryMPConfig):
+        fixed_level = config.get_fixed_level(operator or "")
+        if fixed_level is not None:
+            return _classify_all_rows_to_level(metric, levels, fixed_level)
+        boundaries = config.get_boundaries(operator or "")
+        return _classify_with_free_boundaries(metric, boundaries, levels)
+
+    # ---------- Quantile path (target_fractions set) ----------
+    # Independent of (t, T) / alpha / beta. Top frac[0] rows -> levels[0], etc.
+    if config.target_fractions is not None:
+        sorted_idx = metric.argsort(descending=True)
+        row_levels_q = torch.empty(N, dtype=torch.long, device=metric.device)
+        level_row_indices_q: dict[int, torch.Tensor] = {}
+        offset = 0
+        for i, (sl, frac) in enumerate(zip(levels, config.target_fractions)):
+            if i < n_levels - 1:
+                count = round(frac * N)
+            else:
+                count = N - offset
+            rows_q = sorted_idx[offset:offset + count]
+            row_levels_q[rows_q] = i
+            level_row_indices_q[sl] = rows_q
+            offset += count
+        return RowAssignment(row_levels=row_levels_q,
+                             level_row_indices=level_row_indices_q)
+
     # progress: 1 at noisiest (t=T-1), 0 at cleanest (t=0)
     # Early (noisy) steps → high progress → high base_threshold → aggressive
     # Late (clean) steps → low progress → low base_threshold → conservative
@@ -387,6 +446,220 @@ def adaptive_classify_rows(
         level_row_indices[sl] = torch.where(row_levels == i)[0]
 
     return RowAssignment(row_levels=row_levels, level_row_indices=level_row_indices)
+
+
+# =====================================================================
+# Free-boundary MP (zero hyperparameter; offline oracle-search populated)
+# =====================================================================
+
+@dataclass
+class FreeBoundaryMPConfig(AdaptiveMPConfig):
+    """Per-(block, op) k-1 free boundaries on normalized metric in [0, 1].
+
+    Subclasses ``AdaptiveMPConfig`` so existing ``isinstance(cfg,
+    AdaptiveMPConfig)`` dispatch in the SC attention patch continues to
+    fire. The inherited ``alpha`` / ``beta`` / ``target_fractions`` fields
+    are ignored when the classifier takes the free-boundary branch.
+
+    Boundaries are keyed by ``(block_idx, op_name)``; block_idx is read
+    from the module-level ``_CURRENT_BLOCK_IDX`` at classification time
+    (set by forward pre-hooks installed by the auto-calibrator).
+
+    Missing entries fall back to ``default_boundaries`` (equal spacing).
+    Callers may also pin an op to a fixed level index via ``fixed_levels``;
+    this is useful when some ops should stay coarse/static while others are
+    searched by auto-MP.
+    """
+    # {(block_idx, op_name): tensor of k-1 boundaries, descending in (0, 1)}
+    boundaries: dict = field(default_factory=dict)
+    # {(block_idx, op_name): level_idx}, where level_idx indexes stoc_len_levels
+    fixed_levels: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        # sanity-check any pre-populated entries
+        k = len(self.stoc_len_levels)
+        for key, b in self.boundaries.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"boundaries key must be (block_idx, op_name), got {key!r}")
+            bt = b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+            assert bt.numel() == k - 1, (
+                f"boundaries[{key!r}] must have length {k-1}, got {bt.numel()}")
+        for key, level_idx in self.fixed_levels.items():
+            assert isinstance(key, tuple) and len(key) == 2, (
+                f"fixed_levels key must be (block_idx, op_name), got {key!r}")
+            li = int(level_idx)
+            assert 0 <= li < k, (
+                f"fixed_levels[{key!r}] must be in [0, {k}), got {li}")
+
+    def default_boundaries(self) -> torch.Tensor:
+        """Equal-spacing boundaries in (0, 1) descending, length k-1."""
+        k = len(self.stoc_len_levels)
+        return torch.tensor(
+            [(k - 1 - i) / k for i in range(k - 1)], dtype=torch.float32)
+
+    def get_boundaries(self, operator: str,
+                       block_idx: Optional[int] = None) -> torch.Tensor:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        key = (int(block_idx), operator)
+        if key in self.boundaries:
+            b = self.boundaries[key]
+            return b if isinstance(b, torch.Tensor) else torch.as_tensor(b)
+        return self.default_boundaries()
+
+    def set_boundaries(self, operator: str, block_idx: int,
+                       boundaries: torch.Tensor) -> None:
+        bt = (boundaries.detach().cpu().float() if isinstance(boundaries, torch.Tensor)
+              else torch.as_tensor(boundaries, dtype=torch.float32))
+        k = len(self.stoc_len_levels)
+        assert bt.numel() == k - 1, (
+            f"expected {k-1} boundaries, got {bt.numel()}")
+        self.fixed_levels.pop((int(block_idx), operator), None)
+        self.boundaries[(int(block_idx), operator)] = bt
+
+    def get_fixed_level(self, operator: str,
+                        block_idx: Optional[int] = None) -> Optional[int]:
+        if block_idx is None:
+            block_idx = _CURRENT_BLOCK_IDX
+        level_idx = self.fixed_levels.get((int(block_idx), operator))
+        return None if level_idx is None else int(level_idx)
+
+    def set_fixed_level(self, operator: str, block_idx: int,
+                        level_idx: int) -> None:
+        li = int(level_idx)
+        k = len(self.stoc_len_levels)
+        assert 0 <= li < k, f"level_idx must be in [0, {k}), got {li}"
+        key = (int(block_idx), operator)
+        self.boundaries.pop(key, None)
+        self.fixed_levels[key] = li
+
+    def clear_fixed_level(self, operator: str, block_idx: int) -> None:
+        self.fixed_levels.pop((int(block_idx), operator), None)
+
+
+def _classify_all_rows_to_level(
+    metric: torch.Tensor,
+    stoc_len_levels: list[int],
+    level_idx: int,
+) -> "RowAssignment":
+    """Assign every row/head to one fixed level index."""
+    N = metric.shape[0]
+    row_levels = torch.full(
+        (N,), int(level_idx), dtype=torch.long, device=metric.device)
+    level_row_indices: dict[int, torch.Tensor] = {}
+    for idx, sl in enumerate(stoc_len_levels):
+        if idx == int(level_idx):
+            level_row_indices[sl] = torch.arange(N, device=metric.device)
+        else:
+            level_row_indices[sl] = torch.empty(
+                0, dtype=torch.long, device=metric.device)
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
+
+
+def _classify_with_free_boundaries(
+    metric: torch.Tensor,
+    boundaries: torch.Tensor,
+    stoc_len_levels: list[int],
+) -> "RowAssignment":
+    """Bucket rows by normalized metric against free, non-equal-spaced
+    descending boundaries. See ``adaptive_classify_rows`` for the semantics
+    (level 0 = highest stoc_len, assigned to rows above the first boundary).
+    """
+    N = metric.shape[0]
+    n_levels = len(stoc_len_levels)
+
+    m_min = metric.min()
+    m_max = metric.max()
+    if (m_max - m_min).item() < 1e-8:
+        # Degenerate distribution: default to level 0.
+        row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+        level_row_indices: dict[int, torch.Tensor] = {}
+        for idx, sl in enumerate(stoc_len_levels):
+            if idx == 0:
+                level_row_indices[sl] = torch.arange(N, device=metric.device)
+            else:
+                level_row_indices[sl] = torch.empty(
+                    0, dtype=torch.long, device=metric.device)
+        return RowAssignment(row_levels=row_levels,
+                             level_row_indices=level_row_indices)
+
+    metric_norm = (metric - m_min) / (m_max - m_min)
+
+    # Ensure descending order for safety — boundaries may come from a
+    # coord-descent step that hasn't yet re-sorted.
+    b_sorted, _ = torch.sort(boundaries.to(metric.device).float(),
+                             descending=True)
+    row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)
+    for k in range(n_levels - 1):
+        row_levels[metric_norm < b_sorted[k]] = k + 1
+
+    level_row_indices = {}
+    for i, sl in enumerate(stoc_len_levels):
+        level_row_indices[sl] = torch.where(row_levels == i)[0]
+    return RowAssignment(row_levels=row_levels,
+                         level_row_indices=level_row_indices)
+
+
+# =====================================================================
+# Auto-MP budget logger (compute savings tracking during oracle search)
+# =====================================================================
+
+class AutoMPBudgetLogger:
+    """Lightweight per-forward compute logger for budget-aware auto-MP.
+
+    SC operators record a baseline cost (all rows/heads at max stoc_len) and
+    the actual weighted stoc_len cost induced by the current assignment. The
+    auto-MP calibrator enables this logger only while scoring candidate
+    boundaries, so it sees the true block-local compute for that candidate.
+    """
+
+    _enabled: bool = False
+    _log: list[dict] = []
+
+    @classmethod
+    def enable(cls):
+        cls._enabled = True
+
+    @classmethod
+    def disable(cls):
+        cls._enabled = False
+
+    @classmethod
+    def clear(cls):
+        cls._log.clear()
+
+    @classmethod
+    def record(cls, block_idx: int, operator: str,
+               baseline: float, actual: float):
+        if not cls._enabled:
+            return
+        cls._log.append({
+            "block": int(block_idx),
+            "operator": operator,
+            "baseline": float(baseline),
+            "actual": float(actual),
+        })
+
+    @classmethod
+    def snapshot(cls, clear: bool = False) -> list[dict]:
+        out = list(cls._log)
+        if clear:
+            cls.clear()
+        return out
+
+    @classmethod
+    def totals(cls, clear: bool = False) -> dict[str, float]:
+        total_baseline = 0.0
+        total_actual = 0.0
+        for entry in cls._log:
+            total_baseline += entry["baseline"]
+            total_actual += entry["actual"]
+        out = {"baseline": total_baseline, "actual": total_actual}
+        if clear:
+            cls.clear()
+        return out
 
 
 # =====================================================================
