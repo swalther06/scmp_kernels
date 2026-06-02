@@ -127,3 +127,46 @@ def test_unknown_mode():
     b = torch.randn(16, 64, device="cuda")
     with pytest.raises(ValueError, match="mode"):
         sc_matmul(a, b, mode="ternary")
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU device guard — regression for the cuda:1 illegal-memory-access bug.
+# Triton launches on the current device (cuda:0); without the device guard in
+# sc_matmul, tensors on cuda:1 (e.g. layers sharded by device_map="auto" on a
+# 70B) crash with "CUDA error: an illegal memory access was encountered".
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="multi-GPU device-guard test needs >= 2 CUDA devices.")
+@pytest.mark.parametrize("granularity,chunk_d,shape", [
+    ("per_tensor", 0, "2d"),
+    ("per_row", 0, "2d"),
+    ("per_row", 128, "2d"),     # MLP chunked path — where the 70B crash hit
+    ("per_row", 0, "3d"),
+    ("per_head", 0, "3d"),
+])
+def test_runs_on_second_gpu(granularity, chunk_d, shape):
+    """sc_matmul on cuda:1 inputs must run and match the cuda:0 result.
+
+    The current device stays cuda:0 (default); the guard inside sc_matmul is
+    what makes the kernels launch on cuda:1 instead of faulting.
+    """
+    from scmp_kernels import sc_matmul
+    torch.manual_seed(0)
+    if shape == "2d":
+        a0 = torch.randn(8, 256, device="cuda:0")
+        b0 = torch.randn(16, 256, device="cuda:0")
+    else:
+        a0 = torch.randn(4, 8, 64, device="cuda:0")
+        b0 = torch.randn(4, 16, 64, device="cuda:0")
+
+    assert torch.cuda.current_device() == 0
+    y0 = sc_matmul(a0, b0, granularity=granularity, chunk_d=chunk_d, sc_prec=8)
+    y1 = sc_matmul(a0.to("cuda:1"), b0.to("cuda:1"),
+                   granularity=granularity, chunk_d=chunk_d, sc_prec=8)
+
+    assert y1.device.index == 1                 # output stays on the input GPU
+    assert torch.cuda.current_device() == 0     # guard restored the device
+    # Same RNG config + inputs -> identical SC result on either GPU.
+    assert torch.equal(y0.cpu(), y1.cpu())
