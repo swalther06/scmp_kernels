@@ -197,33 +197,32 @@ def classify_rows_by_metric(
 
 @dataclass
 class AdaptiveMPConfig:
-    """Timestep-adaptive mixed precision with true thresholds and per-operator
-    parameters.
+    """Mixed precision driven by calibrated per-row thresholds.
 
-    Uses absolute thresholds on normalized metric values instead of fixed
-    fractions.  The number of rows per level adapts to the actual data
-    distribution.
+    Rows are classified by one of three data-driven paths (checked in this
+    order by ``adaptive_classify_rows``):
 
-    Threshold: base_threshold(t) = α · progress(t) + β
-    where progress(t) = t / (T-1)  ∈ [0, 1] (high at noisy, low at clean).
+      1. Free-boundary (``FreeBoundaryMPConfig`` subclass): per-(block, op)
+         boundaries populated by the offline auto-MP oracle search.
+      2. Quantile (``target_fractions`` set): top frac[0] rows -> levels[0],
+         etc. — distribution-independent fixed fractions.
+      3. Calibrated table (``threshold_table_path`` set): per-(operator,
+         timestep_bucket, layer_bucket) thresholds from
+         ``calibrate_mp_thresholds.py``.
 
-    Rows with high normalized metric → high stoc_len (precise).
-    Rows with low normalized metric → low stoc_len or pruned.
+    There is no closed-form fallback. The earlier ``alpha * progress + beta``
+    dynamic-threshold mode was removed — it was unused by every consumer and
+    only added a confusing path alongside the calibrated table. A classify
+    call that matches none of the three paths is a configuration bug and
+    raises.
 
     Args:
         stoc_len_levels: Descending list of stoc_len values.
             Use 0 as the last level to enable pruning (skip).
-        alpha: Global default sensitivity to timestep progress.
-        beta: Global default base threshold offset.
         enable_pruning: Allow stoc_len=0 (skip) level.
-        operator_params: Per-operator (alpha, beta) overrides.
-            Keys: "qk", "av", "mlp_fc1", "mlp_fc2", "input_proj", "proj".
     """
     stoc_len_levels: list[int]
-    alpha: float = 0.3
-    beta: float = 0.05
     enable_pruning: bool = True
-    operator_params: dict[str, tuple[float, float]] = field(default_factory=dict)
     threshold_table_path: Optional[str] = None
     timestep_buckets: int = 1
     layer_buckets: int = 1
@@ -252,12 +251,6 @@ class AdaptiveMPConfig:
             s = sum(self.target_fractions)
             assert abs(s - 1.0) < 1e-6, (
                 f"target_fractions must sum to 1.0, got {s}")
-
-    def get_params(self, operator: Optional[str] = None) -> tuple[float, float]:
-        """Get (alpha, beta) for an operator, falling back to global."""
-        if operator and operator in self.operator_params:
-            return self.operator_params[operator]
-        return (self.alpha, self.beta)
 
     def load_threshold_table(self, path: str):
         """Load calibrated thresholds exported by calibrate_mp_thresholds.py."""
@@ -314,28 +307,30 @@ class AdaptiveMPConfig:
 
 def adaptive_classify_rows(
     metric: torch.Tensor,
-    timestep: int,
-    total_timesteps: int,
     config: AdaptiveMPConfig,
     operator: Optional[str] = None,
     block_idx: Optional[int] = None,
     total_blocks: Optional[int] = None,
+    timestep: int = 0,
+    total_timesteps: int = 1,
 ) -> RowAssignment:
-    """Classify rows using true absolute thresholds on normalized metrics.
+    """Classify rows by one of three data-driven paths (no closed-form mode).
 
-    Unlike quantile-based classification, the number of rows per level
-    adapts to the actual metric distribution.  Per-operator α/β allows
-    different aggressiveness for different operators.
+    Checked in order: free-boundary (``FreeBoundaryMPConfig``), quantile
+    (``target_fractions``), then calibrated table (``threshold_table_path``).
+    Matching none of them is a configuration bug and raises.
 
     Args:
         metric: [N] per-row importance values (e.g. row abs-max).
-        timestep: Current diffusion timestep (T-1 = noisiest, 0 = cleanest).
-        total_timesteps: Total number of diffusion timesteps T.
         config: AdaptiveMPConfig instance.
-        operator: Operator name for per-operator α/β lookup.
+        operator: Operator name for table / boundary lookup (e.g. "q_proj", "qk").
+        block_idx: Layer / block index for table / boundary lookup.
+        total_blocks: Total number of layers / blocks (used for bucketing).
+        timestep: Diffusion timestep for table bucketing. LLM inference: 0.
+        total_timesteps: Total diffusion timesteps for bucketing. LLM: 1.
 
     Returns:
-        RowAssignment compatible with existing code.
+        RowAssignment compatible with existing dispatch code.
     """
     N = metric.shape[0]
     levels = config.stoc_len_levels
@@ -371,22 +366,7 @@ def adaptive_classify_rows(
         return RowAssignment(row_levels=row_levels_q,
                              level_row_indices=level_row_indices_q)
 
-    # progress: 1 at noisiest (t=T-1), 0 at cleanest (t=0)
-    # Early (noisy) steps → high progress → high base_threshold → aggressive
-    # Late (clean) steps → low progress → low base_threshold → conservative
-    progress = timestep / max(total_timesteps - 1, 1)
-
-    # Per-operator α/β
-    alpha, beta = config.get_params(operator)
-
-    # Base threshold: the cutoff on normalized metric [0,1].
-    # Rows with metric_norm >= base_threshold → level 0 (highest precision).
-    # Rows with metric_norm < base_threshold → split among lower levels.
-    # Higher base_threshold = more rows get lower precision.
-    # base_threshold=0.95 (very aggressive) → only top 5% get level 0.
-    base_threshold = alpha * progress + beta
-    base_threshold = min(base_threshold, 0.95)
-
+    # ---------- Calibrated-table path (threshold_table_path set) ----------
     # Normalize metric to [0, 1]
     m_min = metric.min()
     m_max = metric.max()
@@ -415,37 +395,16 @@ def adaptive_classify_rows(
     if calibrated_thresholds is not None:
         return _classify_rows_by_thresholds(metric_norm, levels, calibrated_thresholds)
 
-    # Split [0, base_threshold] evenly among non-highest levels.
-    # For 3 levels [256, 64, 0] with base_threshold=0.3:
-    #   metric_norm >= 0.3  → level 0 (sl=256)
-    #   0.15 <= metric_norm < 0.3  → level 1 (sl=64)
-    #   metric_norm < 0.15  → level 2 (sl=0, pruned)
-    #
-    # N-1 boundaries from high to low:
-    #   boundaries[0] = base_threshold  (between level 0 and level 1)
-    #   boundaries[k] = base_threshold * (n_levels - 1 - k) / (n_levels - 1)
-    row_levels = torch.zeros(N, dtype=torch.long, device=metric.device)  # default: level 0
-
-    boundaries = []
-    for k in range(n_levels - 1):
-        # boundary[0] = base_threshold (highest, between level 0 and 1)
-        # boundary[n-2] = base_threshold / (n-1) (lowest, between level n-2 and n-1)
-        b = base_threshold * (n_levels - 1 - k) / (n_levels - 1)
-        boundaries.append(b)
-
-    # Assign from lowest precision upward:
-    # Everything starts at level 0 (highest precision).
-    # Then demote rows below each boundary.
-    for k in range(n_levels - 1):
-        # Rows with metric_norm < boundaries[k] get demoted to level k+1 or lower
-        row_levels[metric_norm < boundaries[k]] = k + 1
-
-    # Build level_row_indices
-    level_row_indices: dict[int, torch.Tensor] = {}
-    for i, sl in enumerate(levels):
-        level_row_indices[sl] = torch.where(row_levels == i)[0]
-
-    return RowAssignment(row_levels=row_levels, level_row_indices=level_row_indices)
+    # No path matched (not free-boundary, no target_fractions, and no
+    # calibrated thresholds for this operator/bucket). There is no closed-form
+    # fallback — this is a configuration bug.
+    raise ValueError(
+        f"AdaptiveMPConfig: no classification path for operator={operator!r} "
+        f"block_idx={block_idx} (not a FreeBoundaryMPConfig, target_fractions "
+        f"unset, and no calibrated thresholds — bucket miss and no "
+        f"operator_default). Re-run calibration covering this operator/layer, "
+        f"or set target_fractions."
+    )
 
 
 # =====================================================================
