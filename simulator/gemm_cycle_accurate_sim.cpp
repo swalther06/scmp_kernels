@@ -20,9 +20,14 @@
 //     lane's product sign.  These sign registers change at most ONCE per
 //     window (a whole bitstream shares one sign), so the XNOR output is
 //     constant for all T cycles -- no per-cycle sign switching.
-//   * Each AND-1 event is routed by its lane sign into popcnt_pos or
-//     popcnt_neg, accumulated into oreg_pos / oreg_neg respectively.
-//   * drain_reg = oreg_pos - oreg_neg  (no bias; sc_matmul is A*B only).
+//   * Each cycle adds K + popcnt_pos - popcnt_neg (always in [0, 2K]) into a
+//     SINGLE accumulator oreg -- a constant "+K" offset replaces the old
+//     two-accumulator (oreg_pos/oreg_neg) split, so there's one register and
+//     one adder per PE instead of two.
+//   * drain_reg = oreg - K*T : the K*T offset built up over the T-cycle
+//     window is removed ONCE, by subtracting a compile-time CONSTANT
+//     (cheaper than a register-vs-register subtract).  No additive bias term
+//     in the GEMM itself -- sc_matmul is still A*B only.
 //
 // Systolic geometry (N_ROWS x N_COLS tiles, may be non-square)
 //   inputs  flow west  -> east   (west column is the input  edge)
@@ -44,7 +49,7 @@
 //   A lane's expected AND count over T cycles is
 //     T * (boundary_a / RNG_LEVELS) * (boundary_b / RNG_LEVELS)
 //       ~= T * (mag_a / q_max) * (mag_w / q_max),
-//   so  drain = oreg_pos - oreg_neg ~= (sum mag_a*mag_w) * T / q_max^2.
+//   so  drain = oreg - K*T ~= (sum mag_a*mag_w) * T / q_max^2.
 //   With per-tensor scale S = abs_max / q_max, the real dot product is
 //     real = drain * S_a * S_b / T
 //   which is exactly scmp's decode count*(q_max^2/stoc_len)*(S_a)*(S_b)
@@ -62,10 +67,13 @@
 // Energy accounting -- what is and isn't counted (see struct Stats):
 //   counted    : AND-1 events, accumulator updates, mag wire toggles, the
 //                once-per-window sign wire toggles, drain shifts, edge loads,
-//                RNG steps, comparator evals.
-//   NOT counted: AND-0 outputs (no switching), the stationary sign XNOR (no
-//                per-cycle switching), popcount-tree internal adds (only the
-//                net accumulator increment is priced).
+//                RNG steps, comparator evals.  The single-accumulator +K
+//                offset (see "Tile inner structure" above) means oreg updates
+//                almost every cycle, even when all K lanes AND to 0 -- an
+//                inherent cost of folding the old +/- split into one register.
+//   NOT counted: the stationary sign XNOR (no per-cycle switching),
+//                popcount-tree internal adds (only the net accumulator
+//                increment is priced).
 //
 // Build: `make` (see Makefile), or directly
 //   g++ -std=c++17 -O2 -Wall -Wextra tile.cpp -o tile_sim
@@ -101,6 +109,15 @@
 #ifndef CFG_OWEN
 #define CFG_OWEN 0                       // 1 = per-lane Owen XOR scramble (decorrelate K lanes)
 #endif
+#ifndef CFG_M_ROWS
+#define CFG_M_ROWS 1                     // PEs per tile, row direction (M tier height); >1 not yet implemented
+#endif
+#ifndef CFG_M_COLS
+#define CFG_M_COLS 1                     // PEs per tile, column direction (M tier width); >1 not yet implemented
+#endif
+#ifndef CFG_L
+#define CFG_L 1                          // stream bits processed per cycle (L); >1 not yet implemented
+#endif
 
 // Precision model matches scmp_kernels bipolar quantization:
 //   sc_prec    = MAG_BITS + 1            (e.g. 8-bit signed = 7 mag bits + 1 sign)
@@ -119,6 +136,17 @@ constexpr int   T          = CFG_STOC_LEN;                  // bitstream length 
 constexpr int   K          = CFG_K;                         // diagonal length per tile
 constexpr int   N_ROWS     = CFG_N_ROWS;                    // systolic tile rows
 constexpr int   N_COLS     = CFG_N_COLS;                    // systolic tile cols
+constexpr int   M_ROWS     = CFG_M_ROWS;                    // PEs per tile, rows (combinational tier height)
+constexpr int   M_COLS     = CFG_M_COLS;                    // PEs per tile, cols (combinational tier width)
+constexpr int   L          = CFG_L;                         // stream bits per cycle (bitstream parallelism)
+
+// M and L are DSE axes. M is fully wired: Tile is a genuine M_ROWS x M_COLS
+// combinational PE block, and Systolic's load_inputs/load_weights/drain all
+// address every internal PE row/col (global row/col -> (tile, internal PE)
+// mapping; see load_inputs and the drain-phase comment in tick()). L is the
+// one still missing: tick() advances one stream bit per lane per cycle; L>1
+// needs a 2D popcount over L and K.
+static_assert(L == 1, "CFG_L > 1 not yet implemented: tick() is still one stream bit per cycle");
 
 // Activity counters used as proxies for dynamic energy.
 struct Stats {
@@ -127,7 +155,7 @@ struct Stats {
     uint64_t and_neg          = 0;  // AND-1 events routed to popcnt_neg
     uint64_t oreg_inc         = 0;  // non-zero accumulator updates (either polarity)
     uint64_t add_op           = 0;  // adds  (pos accum, neg accum)
-    uint64_t sub_op           = 0;  // subs  (oreg_pos - oreg_neg at drain)
+    uint64_t sub_op           = 0;  // subs  (oreg - K*T at drain)
     uint64_t link_toggle      = 0;  // inter-tile MAG flop bit transitions (per cycle)
     uint64_t sign_link_toggle = 0;  // inter-tile SIGN flop transitions (once per window per hop)
     uint64_t drain_shift      = 0;  // drain register transitions during shift
@@ -220,26 +248,38 @@ struct Sobol {
     }
 };
 
-// Tile: K diagonal magnitude ANDs + K stationary-sign XNORs feeding split
-// popcounts into oreg_pos / oreg_neg.  Output = oreg_pos - oreg_neg (A*B).
+// Tile: an M_ROWS x M_COLS combinational block of PEs (the M tier).  Each
+// PE(i,j) runs K diagonal magnitude ANDs + K stationary-sign XNORs, then adds
+// K + popcnt_pos - popcnt_neg (always in [0, 2K]) into a single accumulator
+// oreg[i][j] (output = A*B).  Row i's input K-vector is shared (broadcast)
+// across all M_COLS PEs in that row; column j's weight K-vector is shared
+// across all M_ROWS PEs in that column -- no registers between PEs (that's
+// what makes M combinational vs. N's systolic flops).
 class Tile {
 public:
     bool is_input_edge  = false;   // west column: comparator drives in_mag_bits from in_mag
     bool is_weight_edge = false;   // south row : comparator drives w_mag_bits  from w_mag
 
-    // Stationary operand registers (held for a whole window).
+    // Stationary operand registers (held for a whole window): M_ROWS distinct
+    // input K-vectors, M_COLS distinct weight K-vectors.
     // in_mag/w_mag hold the remapped boundary (0..RNG_LEVELS), not raw magnitude.
-    std::array<mag_t, K> in_mag{},  w_mag{};
-    std::array<bool,  K> in_sign{}, w_sign{};  // 1-bit signs (true = negative)
+    std::array<std::array<mag_t, K>, M_ROWS> in_mag{};
+    std::array<std::array<mag_t, K>, M_COLS> w_mag{};
+    std::array<std::array<bool,  K>, M_ROWS> in_sign{};  // 1-bit signs (true = negative)
+    std::array<std::array<bool,  K>, M_COLS> w_sign{};
 
     // Per-cycle stream bits -- MAGNITUDE only (signs are stationary, above).
-    std::array<bool, K> in_mag_bits{}, w_mag_bits{};
+    std::array<std::array<bool, K>, M_ROWS> in_mag_bits{};
+    std::array<std::array<bool, K>, M_COLS> w_mag_bits{};
     // Pass-through stream bits latched into the downstream inter-tile flops.
-    std::array<bool, K> in_mag_out{},  w_mag_out{};
+    std::array<std::array<bool, K>, M_ROWS> in_mag_out{};
+    std::array<std::array<bool, K>, M_COLS> w_mag_out{};
 
-    int oreg_pos  = 0;
-    int oreg_neg  = 0;
-    int drain_reg = 0;
+    // Single biased accumulator per PE (replaces oreg_pos/oreg_neg): holds
+    // sum over the window of (K + popcnt_pos - popcnt_neg), i.e. the true
+    // dot product plus a K*T offset removed once at drain (see load_drain).
+    std::array<std::array<int, M_COLS>, M_ROWS> oreg{};
+    std::array<std::array<int, M_COLS>, M_ROWS> drain_reg{};
     Stats stats;
 
     // One combinational cycle.  Edge faces generate this cycle's stream bit
@@ -247,60 +287,104 @@ public:
     // the inter-tile flop latched LAST cycle (true systolic, one hop/cycle).
     void compute(mag_t rng_i, mag_t rng_w) {
         if (is_input_edge) {
-            for (int d = 0; d < K; ++d) {
-                mag_t thr_i = (rng_i ^ OWEN_IN[d]) & RNG_MASK;   // per-lane scramble (no-op if CFG_OWEN=0)
-                in_mag_bits[d] = in_mag[d] > thr_i;              // in_mag holds the remapped boundary
-                ++stats.cmp_eval;
-            }
+            for (int i = 0; i < M_ROWS; ++i)
+                for (int d = 0; d < K; ++d) {
+                    mag_t thr_i = (rng_i ^ OWEN_IN[d]) & RNG_MASK;   // per-lane scramble (no-op if CFG_OWEN=0)
+                    in_mag_bits[i][d] = in_mag[i][d] > thr_i;        // in_mag holds the remapped boundary
+                    ++stats.cmp_eval;
+                }
         }
         if (is_weight_edge) {
-            for (int d = 0; d < K; ++d) {
-                mag_t thr_w = (rng_w ^ OWEN_W[d]) & RNG_MASK;
-                w_mag_bits[d] = w_mag[d] > thr_w;
-                ++stats.cmp_eval;
+            for (int j = 0; j < M_COLS; ++j)
+                for (int d = 0; d < K; ++d) {
+                    mag_t thr_w = (rng_w ^ OWEN_W[d]) & RNG_MASK;
+                    w_mag_bits[j][d] = w_mag[j][d] > thr_w;
+                    ++stats.cmp_eval;
+                }
+        }
+        // M_ROWS x M_COLS PEs: row i's input bits feed every column, column
+        // j's weight bits feed every row; each PE's lane sign = in_sign[i]
+        // XNOR w_sign[j] (stationary registers, no per-cycle switching).
+        for (int i = 0; i < M_ROWS; ++i) {
+            for (int j = 0; j < M_COLS; ++j) {
+                int popcnt_pos = 0, popcnt_neg = 0;
+                for (int d = 0; d < K; ++d) {
+                    bool a = in_mag_bits[i][d] && w_mag_bits[j][d];
+                    if (a) {
+                        bool neg = (in_sign[i][d] != w_sign[j][d]);   // signs differ => product negative
+                        if (neg) { ++popcnt_neg; ++stats.and_neg; }
+                        else     { ++popcnt_pos; ++stats.and_pos; }
+                        ++stats.and_ones;
+                    }
+                }
+                // Bias trick: add K + popcnt_pos - popcnt_neg (in [0, 2K])
+                // instead of routing into separate +/- accumulators.  Almost
+                // always nonzero (the +K offset alone is enough), so this is
+                // a register update on nearly every cycle -- see "Energy
+                // accounting" above.
+                int delta = K + popcnt_pos - popcnt_neg;
+                if (delta) { oreg[i][j] += delta; ++stats.oreg_inc; ++stats.add_op; }
             }
         }
-        // K diagonal magnitude ANDs; lane sign = in_sign XNOR w_sign (read
-        // from the stationary registers, no per-cycle switching).
-        int popcnt_pos = 0, popcnt_neg = 0;
-        for (int d = 0; d < K; ++d) {
-            bool a = in_mag_bits[d] && w_mag_bits[d];
-            if (a) {
-                bool neg = (in_sign[d] != w_sign[d]);   // signs differ => product negative
-                if (neg) { ++popcnt_neg; ++stats.and_neg; }
-                else     { ++popcnt_pos; ++stats.and_pos; }
-                ++stats.and_ones;
-            }
-            in_mag_out[d] = in_mag_bits[d];
-            w_mag_out[d]  = w_mag_bits[d];
-        }
-        if (popcnt_pos) { oreg_pos += popcnt_pos; ++stats.oreg_inc; ++stats.add_op; }
-        if (popcnt_neg) { oreg_neg += popcnt_neg; ++stats.oreg_inc; ++stats.add_op; }
+        for (int i = 0; i < M_ROWS; ++i)
+            for (int d = 0; d < K; ++d)
+                in_mag_out[i][d] = in_mag_bits[i][d];
+        for (int j = 0; j < M_COLS; ++j)
+            for (int d = 0; d < K; ++d)
+                w_mag_out[j][d] = w_mag_bits[j][d];
     }
 
-    // Drain combine -- pos/neg meet here. (No bias; sc_matmul computes A*B only.)
+    // Drain combine, per PE: remove the K*T offset built up over the window
+    // by subtracting a compile-time CONSTANT (no bias term in the GEMM
+    // itself; sc_matmul computes A*B only).
     void load_drain() {
-        drain_reg = oreg_pos - oreg_neg;
-        ++stats.sub_op;   // oreg_pos - oreg_neg
-        oreg_pos = 0;
-        oreg_neg = 0;
+        for (int i = 0; i < M_ROWS; ++i)
+            for (int j = 0; j < M_COLS; ++j) {
+                drain_reg[i][j] = oreg[i][j] - K * T;
+                ++stats.sub_op;   // oreg - K*T
+                oreg[i][j] = 0;
+            }
     }
 
-    void shift_drain(int from_west) {
-        if (drain_reg != from_west) ++stats.drain_shift;
-        drain_reg = from_west;
+    // Drain shift, one column-position per cycle: lane i is an independent
+    // east-going port (M_ROWS PE-rows never share hardware, same as on the
+    // compute side), but the M_COLS PE-columns within that lane DO share one
+    // port and so must serialize through it.  Lane i's front value (j=0)
+    // exits east -- returned in 'sent', picked up by the east neighbor's
+    // shift_drain call, or by Systolic's east_out at the east edge; positions
+    // 1..M_COLS-1 shift toward the front; the back (j=M_COLS-1) is refilled
+    // by from_west[i], the value the WEST neighbor is sending this very
+    // cycle (0 once that tile's own data is exhausted, or for the west-most
+    // tile, which has nothing further west to draw from).  Draining one
+    // tile's M_COLS values takes M_COLS cycles; N_COLS tiles in series take
+    // N_COLS*M_COLS, matching the file's one-hop-per-cycle systolic style.
+    std::array<int, M_ROWS> shift_drain(const std::array<int, M_ROWS>& from_west) {
+        std::array<int, M_ROWS> sent{};
+        for (int i = 0; i < M_ROWS; ++i) {
+            sent[i] = drain_reg[i][0];
+            for (int j = 0; j + 1 < M_COLS; ++j) {
+                if (drain_reg[i][j] != drain_reg[i][j + 1]) ++stats.drain_shift;
+                drain_reg[i][j] = drain_reg[i][j + 1];
+            }
+            if (drain_reg[i][M_COLS - 1] != from_west[i]) ++stats.drain_shift;
+            drain_reg[i][M_COLS - 1] = from_west[i];
+        }
+        return sent;
     }
 
     // Clear transient per-window state. Stationary operands and Stats kept.
     void reset_window() {
-        oreg_pos = 0; oreg_neg = 0; drain_reg = 0;
-        in_mag_bits.fill(false); w_mag_bits.fill(false);
-        in_mag_out.fill(false);  w_mag_out.fill(false);
+        for (auto& row : oreg)        row.fill(0);
+        for (auto& row : drain_reg)   row.fill(0);
+        for (auto& row : in_mag_bits) row.fill(false);
+        for (auto& row : w_mag_bits)  row.fill(false);
+        for (auto& row : in_mag_out)  row.fill(false);
+        for (auto& row : w_mag_out)   row.fill(false);
     }
 };
 
 // Systolic: owns the two array-wide Sobols, the inter-tile flops (mag + sign
-// halves, each 1 bit per lane), and the tile grid.
+// halves, M_ROWS or M_COLS vectors of 1 bit per lane), and the tile grid.
 //   tiles[0][.]          top row
 //   tiles[N_ROWS-1][.]   south (weight) edge
 //   tiles[.][0]          west (input) edge
@@ -309,13 +393,15 @@ class Systolic {
 public:
     Sobol rng_input, rng_weight;
     std::array<std::array<Tile, N_COLS>, N_ROWS> tiles;
-    // MAGNITUDE bitstream flops (toggle every cycle).  link_*[r][c] feeds tile (r,c).
-    std::array<std::array<std::array<bool, K>, N_COLS>, N_ROWS> link_we_mag{};
-    std::array<std::array<std::array<bool, K>, N_COLS>, N_ROWS> link_ns_mag{};
+    // MAGNITUDE bitstream flops (toggle every cycle).  link_*[r][c] feeds tile
+    // (r,c) the same M_ROWS (input) or M_COLS (weight) lane vectors its Tile
+    // holds internally.
+    std::array<std::array<std::array<std::array<bool, K>, M_ROWS>, N_COLS>, N_ROWS> link_we_mag{};
+    std::array<std::array<std::array<std::array<bool, K>, M_COLS>, N_COLS>, N_ROWS> link_ns_mag{};
     // SIGN flops (1 bit per lane).  Written once per window by load_*; held all T cycles.
-    std::array<std::array<std::array<bool, K>, N_COLS>, N_ROWS> link_we_sign{};
-    std::array<std::array<std::array<bool, K>, N_COLS>, N_ROWS> link_ns_sign{};
-    std::array<int, N_ROWS> east_out{};
+    std::array<std::array<std::array<std::array<bool, K>, M_ROWS>, N_COLS>, N_ROWS> link_we_sign{};
+    std::array<std::array<std::array<std::array<bool, K>, M_COLS>, N_COLS>, N_ROWS> link_ns_sign{};
+    std::array<int, N_ROWS * M_ROWS> east_out{};   // indexed by global row r*M_ROWS+i
     Stats systolic_stats;
     int  tick_in_phase = 0;
     bool computing     = true;
@@ -328,52 +414,66 @@ public:
         for (int c = 0; c < N_COLS; ++c) tiles[N_ROWS-1][c].is_weight_edge = true;
     }
 
-    // Load A's row r.  Magnitude is written only to the west-edge tile -- it
-    // becomes the bitstream via the comparator and marches east one tile per
-    // cycle through link_we_mag.  Sign is constant for the whole stream, so it
-    // is set into each tile's sign register and the sign flops; those flops
-    // change at most once per window (sign_link_toggle counts only real changes).
-    void load_inputs(int r, const std::array<mag_t, K>& mag,
-                            const std::array<bool,  K>& sign) {
-        tiles[r][0].in_mag  = mag;
-        tiles[r][0].in_sign = sign;
+    // Load A's global row (0..N_ROWS*M_ROWS-1) into internal PE-row i of
+    // west-edge tile r, where r = row/M_ROWS, i = row%M_ROWS -- i.e. tile
+    // row r's M_ROWS internal PE-rows are global rows [r*M_ROWS, r*M_ROWS+M_ROWS).
+    // Magnitude becomes the bitstream via the comparator and marches east one
+    // tile per cycle through link_we_mag[.][.][i]; all M_COLS PEs in PE-row i
+    // see the same stream (input reused across columns, per the tile doc).
+    // Sign is constant for the whole stream, so it is set into each tile's
+    // sign register and the sign flops; those flops change at most once per
+    // window (sign_link_toggle counts only real changes).
+    void load_inputs(int row, const std::array<mag_t, K>& mag,
+                              const std::array<bool,  K>& sign) {
+        int r = row / M_ROWS, i = row % M_ROWS;
+        tiles[r][0].in_mag[i]  = mag;
+        tiles[r][0].in_sign[i] = sign;
         tiles[r][0].stats.bin_load += 2 * K;   // edge mag reg + edge sign reg
         for (int c = 1; c < N_COLS; ++c) {
             for (int d = 0; d < K; ++d)
-                if (link_we_sign[r][c][d] != sign[d]) ++systolic_stats.sign_link_toggle;
-            link_we_sign[r][c]  = sign;         // one-shot per-window sign hop
-            tiles[r][c].in_sign = sign;         // tile's stationary sign register
+                if (link_we_sign[r][c][i][d] != sign[d]) ++systolic_stats.sign_link_toggle;
+            link_we_sign[r][c][i]  = sign;         // one-shot per-window sign hop
+            tiles[r][c].in_sign[i] = sign;         // tile's stationary sign register
         }
     }
-    // Load B's column c (mirror of the above, weights flow south->north).
-    void load_weights(int c, const std::array<mag_t, K>& mag,
-                             const std::array<bool,  K>& sign) {
-        tiles[N_ROWS-1][c].w_mag  = mag;
-        tiles[N_ROWS-1][c].w_sign = sign;
+    // Load B's global col (0..N_COLS*M_COLS-1) into internal PE-col j of
+    // south-edge tile c, where c = col/M_COLS, j = col%M_COLS (mirror of the
+    // above, weights flow south->north; weight reused across rows).
+    void load_weights(int col, const std::array<mag_t, K>& mag,
+                               const std::array<bool,  K>& sign) {
+        int c = col / M_COLS, j = col % M_COLS;
+        tiles[N_ROWS-1][c].w_mag[j]  = mag;
+        tiles[N_ROWS-1][c].w_sign[j] = sign;
         tiles[N_ROWS-1][c].stats.bin_load += 2 * K;
         for (int r = 0; r < N_ROWS - 1; ++r) {
             for (int d = 0; d < K; ++d)
-                if (link_ns_sign[r][c][d] != sign[d]) ++systolic_stats.sign_link_toggle;
-            link_ns_sign[r][c]  = sign;
-            tiles[r][c].w_sign  = sign;
+                if (link_ns_sign[r][c][j][d] != sign[d]) ++systolic_stats.sign_link_toggle;
+            link_ns_sign[r][c][j]  = sign;
+            tiles[r][c].w_sign[j]  = sign;
         }
     }
 
     // Clear inter-tile MAG flops and per-tile transient bits (NOT sign flops,
     // NOT oreg/drain -- signs are reloaded each window, oreg handled by drain).
     void clear_window_transient() {
-        for (auto& row : link_we_mag) for (auto& cell : row) cell.fill(false);
-        for (auto& row : link_ns_mag) for (auto& cell : row) cell.fill(false);
+        for (auto& row : link_we_mag) for (auto& cell : row) for (auto& lane : cell) lane.fill(false);
+        for (auto& row : link_ns_mag) for (auto& cell : row) for (auto& lane : cell) lane.fill(false);
         for (auto& row : tiles)
             for (auto& t : row) {
-                t.in_mag_bits.fill(false); t.w_mag_bits.fill(false);
-                t.in_mag_out.fill(false);  t.w_mag_out.fill(false);
+                for (auto& lane : t.in_mag_bits) lane.fill(false);
+                for (auto& lane : t.w_mag_bits)  lane.fill(false);
+                for (auto& lane : t.in_mag_out)  lane.fill(false);
+                for (auto& lane : t.w_mag_out)   lane.fill(false);
             }
     }
 
     void reset_window_state() {
         clear_window_transient();
-        for (auto& row : tiles) for (auto& t : row) { t.oreg_pos = 0; t.oreg_neg = 0; t.drain_reg = 0; }
+        for (auto& row : tiles)
+            for (auto& t : row) {
+                for (auto& lane : t.oreg)      lane.fill(0);
+                for (auto& lane : t.drain_reg) lane.fill(0);
+            }
         east_out.fill(0);
         tick_in_phase = 0;
         computing     = true;
@@ -405,16 +505,18 @@ public:
             //     flops (read next cycle).  Signs are stationary -> untouched.
             for (int r = 0; r < N_ROWS; ++r)
                 for (int c = 0; c < N_COLS; ++c) {
-                    if (c + 1 < N_COLS) {                 // input bit hops east
-                        for (int d = 0; d < K; ++d)
-                            if (link_we_mag[r][c+1][d] != tiles[r][c].in_mag_out[d])
-                                ++systolic_stats.link_toggle;
+                    if (c + 1 < N_COLS) {                 // input bits hop east
+                        for (int i = 0; i < M_ROWS; ++i)
+                            for (int d = 0; d < K; ++d)
+                                if (link_we_mag[r][c+1][i][d] != tiles[r][c].in_mag_out[i][d])
+                                    ++systolic_stats.link_toggle;
                         link_we_mag[r][c+1] = tiles[r][c].in_mag_out;
                     }
-                    if (r > 0) {                          // weight bit hops north
-                        for (int d = 0; d < K; ++d)
-                            if (link_ns_mag[r-1][c][d] != tiles[r][c].w_mag_out[d])
-                                ++systolic_stats.link_toggle;
+                    if (r > 0) {                          // weight bits hop north
+                        for (int j = 0; j < M_COLS; ++j)
+                            for (int d = 0; d < K; ++d)
+                                if (link_ns_mag[r-1][c][j][d] != tiles[r][c].w_mag_out[j][d])
+                                    ++systolic_stats.link_toggle;
                         link_ns_mag[r-1][c] = tiles[r][c].w_mag_out;
                     }
                 }
@@ -427,14 +529,18 @@ public:
                 tick_in_phase = 0;
             }
         } else {
-            // Drain: capture east column, then shift right-to-left.
-            for (int r = 0; r < N_ROWS; ++r) east_out[r] = tiles[r][N_COLS-1].drain_reg;
+            // Drain: each tile-row's M_ROWS lanes are independent east ports
+            // (fed west-to-east so each shift_drain call gets a same-cycle
+            // snapshot of what its west neighbor is sending); within a lane,
+            // a tile's M_COLS columns serialize through that one port.  Total
+            // N_COLS*M_COLS cycles per physical row -- see Tile::shift_drain.
             for (int r = 0; r < N_ROWS; ++r) {
-                for (int c = N_COLS - 1; c > 0; --c)
-                    tiles[r][c].shift_drain(tiles[r][c-1].drain_reg);
-                tiles[r][0].drain_reg = 0;
+                std::array<int, M_ROWS> carry{};   // 0 = nothing arriving from further west
+                for (int c = 0; c < N_COLS; ++c)
+                    carry = tiles[r][c].shift_drain(carry);
+                for (int i = 0; i < M_ROWS; ++i) east_out[r * M_ROWS + i] = carry[i];
             }
-            if (++tick_in_phase == N_COLS) { computing = true; tick_in_phase = 0; }
+            if (++tick_in_phase == N_COLS * M_COLS) { computing = true; tick_in_phase = 0; }
         }
     }
 
@@ -471,7 +577,11 @@ static void quantize(double v, double scale, mag_t& mag, bool& sign) {
 }
 
 static void bipolar_matmul_demo() {
-    constexpr int M_mat = N_ROWS, K_mat = K, N_mat = N_COLS;
+    // M_mat/N_mat are the GEMM's logical output dims -- the FULL physical
+    // grid (N_ROWS*M_ROWS rows, N_COLS*M_COLS cols), not the architecture's
+    // M_ROWS/M_COLS knobs themselves (see the K-vs-M doc: these are sizing
+    // knobs, not a GEMM's logical dimensions).
+    constexpr int M_mat = N_ROWS * M_ROWS, K_mat = K, N_mat = N_COLS * M_COLS;
 
     // Fixed real operands (do NOT depend on MAG_BITS). No bias: O = A*B.
     double A_real[M_mat][K_mat], B_real[K_mat][N_mat];
@@ -502,10 +612,15 @@ static void bipolar_matmul_demo() {
     }
     for (int t = 0; t < T; ++t) sys.tick();
     int drain[M_mat][N_mat] = {};
-    for (int dr = 0; dr < N_COLS; ++dr) {
+    // Drain order: east-most tile first (tile_col counts down), and within a
+    // tile, its M_COLS PE-columns forward (j counts up) -- see
+    // Tile::shift_drain / Systolic::tick's drain phase.
+    for (int dr = 0; dr < N_COLS * M_COLS; ++dr) {
         sys.tick();
-        int tc = N_COLS - 1 - dr;          // east-first drain order
-        if (tc < N_mat) for (int r = 0; r < M_mat; ++r) drain[r][tc] = sys.east_row(r);
+        int tile_col = N_COLS - 1 - dr / M_COLS;
+        int j        = dr % M_COLS;
+        int pc       = tile_col * M_COLS + j;      // physical (global) column
+        if (pc < N_mat) for (int r = 0; r < M_mat; ++r) drain[r][pc] = sys.east_row(r);
     }
 
     // Dequantize (scmp's net per-term scale): real A*B ~= drain * S_a * S_b / T,
@@ -556,7 +671,9 @@ static void bipolar_matmul_demo() {
 
 int main() {
     std::cout << "Architecture (sign-magnitude bipolar SC): K=" << K
+              << ", M_ROWS=" << M_ROWS << ", M_COLS=" << M_COLS
               << ", N_ROWS=" << N_ROWS << ", N_COLS=" << N_COLS
+              << ", L=" << L
               << ", T=" << T << ", MAG_BITS=" << MAG_BITS
               << ", MAG_MAX=" << MAG_MAX << '\n';
     bipolar_matmul_demo();
