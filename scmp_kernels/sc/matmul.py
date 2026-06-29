@@ -46,7 +46,7 @@ def _pin_to_operand_device(fn):
     the previous device is restored on exit.
     """
     @functools.wraps(fn)
-def wrapper(a, b, *args, **kwargs):
+    def wrapper(a, b, *args, **kwargs):
         if a.device != b.device:
             raise ValueError(
                 f"sc_matmul: a and b must be on the same device, got a.device={a.device}, b.device={b.device}."
