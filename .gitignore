@@ -16,3 +16,9 @@ dist/
 
 # OS
 .DS_Store
+
+# Executables
+simulator/*.exe
+
+# Verification files (WIP)
+simulator/*.py
