@@ -55,13 +55,17 @@
 //   after substituting S = abs_max/q_max.  No SC_DENOM, no bias.
 //
 // Lane decorrelation (CFG_OWEN, default off)
-//   All K lanes on one side share ONE rng threshold per cycle (the cheap
-//   "amortized RNG" choice), so the lanes are correlated and the dot product
-//   forfeits the 1/sqrt(K) error averaging it would get from independent
-//   per-lane randomness.  CFG_OWEN=1 XORs each lane's copy of the shared
-//   threshold with a distinct stationary mask (a Weyl/golden-ratio constant)
-//   -- a per-lane wire tap, no extra RNG -- which partially restores that
-//   averaging.  See make_owen() and OWEN_IN / OWEN_W.
+//   Only M physical Sobol generators exist per side (array-wide), so all K
+//   dot-product lanes -- and, within a tile, all N_H/N_W rows -- share the
+//   same M rng thresholds per cycle (the cheap "amortized RNG" choice). Left
+//   unscrambled, the K lanes summed into one accumulator are correlated and
+//   the dot product forfeits the 1/sqrt(K) error averaging it would get from
+//   independent per-lane randomness.  CFG_OWEN=1 XORs each (K,M) lane's copy
+//   of the shared threshold with a distinct stationary mask built from two
+//   Weyl/golden-ratio strides (one per axis) -- a per-lane wire tap, no extra
+//   RNG -- which partially restores that averaging. Bit-exact port of
+//   designs/sc_gemm_3d/cmp_lane.sv in the sibling SCArch repo. See make_owen()
+//   and OWEN_IN / OWEN_W.
 //
 // Energy accounting -- what is and isn't counted (see struct Stats):
 //   counted    : AND-1 events, accumulator updates, mag wire toggles, the
@@ -208,27 +212,32 @@ constexpr std::array<mag_t, SC_PREC> sobol_dirvec(const std::array<int, SC_PREC>
 constexpr std::array<mag_t, SC_PREC> SOBOL_V1 = sobol_dirvec(sobol_seed_q());
 constexpr std::array<mag_t, SC_PREC> SOBOL_V2 = sobol_dirvec(sobol_seed_k());
 
-// Per-lane Owen XOR masks (only active when CFG_OWEN=1).  The K lanes of a
-// tile share ONE rng threshold; XOR-ing each lane's threshold with a distinct
-// stationary mask decorrelates the lanes (a bijection on [0,RNG_LEVELS), so
-// each lane's marginal -- and thus its encoded magnitude -- is unchanged).
-// Masks spread the K lanes evenly across the threshold domain; weights use a
-// half-step offset so input and weight lane-masks differ.  This is a wire tap,
-// no extra RNG -- the same trick as scmp_kernels' _owen_scramble.
-constexpr std::array<mag_t, K> make_owen(mag_t salt) {
-    std::array<mag_t, K> m{};
-    // Weyl / golden-ratio multiplier: odd (coprime to the RNG_LEVELS modulus),
-    // ~0.618 * RNG_LEVELS.  d*GOLDEN spreads the lane index across ALL threshold
-    // bits, not just the high ones -> far stronger lane decorrelation than a
-    // plain high-bit step, and it keeps working as K grows.
-    constexpr mag_t GOLDEN =
-        mag_t(0.6180339887498949 * double(RNG_LEVELS)) | mag_t(1);
+// Per-(K,M)-lane Owen XOR masks (only active when CFG_OWEN=1).  Bit-exact port
+// of designs/sc_gemm_3d/cmp_lane.sv: a single M-wide threshold bus is shared
+// across ALL K dot-product lanes (only M physical Sobol generators exist per
+// side, broadcast array-wide -- see rng_bank.sv / sc_array.sv), so without a
+// per-(d,m) mask every K lane would compare against the identical threshold
+// every cycle. XOR-ing each (d,m) lane's threshold with a distinct stationary
+// mask decorrelates them (a bijection on [0,RNG_LEVELS), so each lane's
+// marginal -- and thus its encoded magnitude -- is unchanged). Two Weyl/
+// golden-ratio strides (exact integer form, matching the RTL's synthesizable
+// (LEVELS*79/128) / (LEVELS*49/128), NOT a floating-point golden ratio) spread
+// the K x M lane grid evenly across the threshold domain; weights use a
+// half-step salt offset so input and weight lane-masks differ too. This is a
+// wire tap, no extra RNG -- the same trick as scmp_kernels' _owen_scramble.
+constexpr mag_t GOLDEN_K = mag_t(((uint64_t(RNG_LEVELS) * 79) / 128) | 1);
+constexpr mag_t GOLDEN_M = mag_t(((uint64_t(RNG_LEVELS) * 49) / 128) | 1);
+constexpr std::array<std::array<mag_t, M>, K> make_owen(mag_t salt) {
+    std::array<std::array<mag_t, M>, K> mask{};
     for (int d = 0; d < K; ++d)
-        m[d] = CFG_OWEN ? ((mag_t(d) * GOLDEN + salt) & RNG_MASK) : mag_t(0);
-    return m;
+        for (int m = 0; m < M; ++m)
+            mask[d][m] = CFG_OWEN
+                ? mag_t((mag_t(d) * GOLDEN_K + mag_t(m) * GOLDEN_M + salt) & RNG_MASK)
+                : mag_t(0);
+    return mask;
 }
-constexpr std::array<mag_t, K> OWEN_IN = make_owen(0);
-constexpr std::array<mag_t, K> OWEN_W  = make_owen(RNG_LEVELS >> 1);
+constexpr std::array<std::array<mag_t, M>, K> OWEN_IN = make_owen(0);
+constexpr std::array<std::array<mag_t, M>, K> OWEN_W  = make_owen(RNG_LEVELS >> 1);
 
 // scmp_kernels-compatible Sobol stepping (sc/rng.py _step): Gray-code XOR that
 // returns the value BEFORE applying the XOR, so the emitted sequence starts at
@@ -252,6 +261,39 @@ struct Sobol {
         return out & RNG_MASK;
     }
 };
+
+// M-wide Sobol bank -- bit-exact port of designs/sc_gemm_3d/rng_bank.sv /
+// sc_kernel.py's RNGBank in the sibling SCArch repo. rng_bank.sv does NOT
+// share one Sobol generator M ways; it instantiates M independent generators,
+// each seeded SEED_BASE ^ (SEED_STRIDE * m), all driven by the same DV table
+// in lockstep -- so lane m's threshold at cycle t is seed_m XOR V(t), not the
+// (t + m)'th term of one running sequence. These are the literal seed/stride
+// pairs from sc_array.sv's u_rng_in / u_rng_w instances (WIDTH=8 8-bit
+// literals -- only exactly matches the RTL when MAG_BITS=7/SC_PREC=8, same
+// restriction sc_array.sv itself has).
+constexpr mag_t SEED_BASE_IN   = 0x17;
+constexpr mag_t SEED_STRIDE_IN = 0x53;
+constexpr mag_t SEED_BASE_W    = 0x9D;
+constexpr mag_t SEED_STRIDE_W  = 0x2B;
+
+// sobol.sv's sobolSeq is a REGISTERED output: it reads SEED at cycle 0 and
+// becomes sobolSeq ^ selected_dv(cnt) *before* being read the next cycle
+// ("return-after"). struct Sobol above instead returns the value *before*
+// applying that cycle's XOR ("return-before", matching scmp_kernels' rng.py,
+// which has no seed-as-initial-value concept at all). Algebraically these are
+// the same sequence shifted by exactly one step, so seeding a lane with
+// `value = seed` and then discarding one throwaway step() call reproduces the
+// RTL's cycle-1 value on the next real call.
+std::array<Sobol, M> make_sobol_bank(mag_t seed_base, mag_t seed_stride, const mag_t* dirvec) {
+    std::array<Sobol, M> bank;
+    for (int m = 0; m < M; ++m) {
+        bank[m].V     = dirvec;
+        bank[m].value = mag_t((seed_base ^ mag_t((uint64_t(seed_stride) * m) & RNG_MASK)) & RNG_MASK);
+        bank[m].index = 0;
+        bank[m].step();   // prime: align phase with the RTL's registered SEED
+    }
+    return bank;
+}
 
 // Tile: an N_H x N_W combinational block of PEs (the N tier).  Each tick,
 // PE(i,j) evaluates K*M AND gates (K lanes x M parallel threshold samples)
@@ -295,7 +337,7 @@ public:
             for (int i = 0; i < N_H; ++i)
                 for (int d = 0; d < K; ++d)
                     for (int m = 0; m < M; ++m) {
-                        mag_t thr_i = (rng_i[m] ^ OWEN_IN[d]) & RNG_MASK;
+                        mag_t thr_i = (rng_i[m] ^ OWEN_IN[d][m]) & RNG_MASK;
                         in_mag_bits[i][d][m] = in_mag[i][d] > thr_i;
                         ++stats.cmp_eval;
                     }
@@ -304,7 +346,7 @@ public:
             for (int j = 0; j < N_W; ++j)
                 for (int d = 0; d < K; ++d)
                     for (int m = 0; m < M; ++m) {
-                        mag_t thr_w = (rng_w[m] ^ OWEN_W[d]) & RNG_MASK;
+                        mag_t thr_w = (rng_w[m] ^ OWEN_W[d][m]) & RNG_MASK;
                         w_mag_bits[j][d][m] = w_mag[j][d] > thr_w;
                         ++stats.cmp_eval;
                     }
@@ -337,12 +379,21 @@ public:
 
     // Drain combine, per PE: remove the K*T offset built up over the window
     // by subtracting a compile-time CONSTANT (no bias term in the GEMM
-    // itself; sc_matmul computes A*B only).
-    void load_drain() {
+    // itself; sc_matmul computes A*B only). `windows` is how many T/M-tick
+    // windows accumulated into oreg since the last drain -- >1 when multiple
+    // K-blocks were chained into one accumulate window without an
+    // intervening drain (see Systolic::end_window / run_workload_binary's
+    // multi-K-block loop): each window adds another K*M*(T/M) = K*T of bias,
+    // so removing it in one shot at the end needs K*T*windows, not K*T. This
+    // is equivalent to sc_kernel.py's per-cycle bias subtract (K*M every
+    // cycle, summed continuously across K-blocks into one accumulator)
+    // because the bias is linear -- subtracting the same total amount once
+    // at the end gives an identical final result.
+    void load_drain(int windows = 1) {
         for (int i = 0; i < N_H; ++i)
             for (int j = 0; j < N_W; ++j) {
-                drain_reg[i][j] = oreg[i][j] - K * T;
-                ++stats.sub_op;   // oreg - K*T
+                drain_reg[i][j] = oreg[i][j] - K * T * windows;
+                ++stats.sub_op;   // oreg - K*T*windows
                 oreg[i][j] = 0;
             }
     }
@@ -392,7 +443,7 @@ public:
 //   tiles[P_ROWS-1][0]   corner (does both conversions)
 class Systolic {
 public:
-    Sobol rng_input, rng_weight;
+    std::array<Sobol, M> rng_input, rng_weight;
     std::array<std::array<Tile, P_COLS>, P_ROWS> tiles;
     // MAGNITUDE bitstream flops (toggle every cycle).  link_*[r][c] feeds tile
     // (r,c) the same N_H (input) or N_W (weight) lane vectors its Tile
@@ -410,7 +461,8 @@ public:
 
     Systolic(const mag_t* dirvec_i = SOBOL_V1.data(),
              const mag_t* dirvec_w = SOBOL_V2.data())
-        : rng_input(dirvec_i), rng_weight(dirvec_w) {
+        : rng_input(make_sobol_bank(SEED_BASE_IN, SEED_STRIDE_IN, dirvec_i)),
+          rng_weight(make_sobol_bank(SEED_BASE_W, SEED_STRIDE_W, dirvec_w)) {
         for (int r = 0; r < P_ROWS; ++r) tiles[r][0].is_input_edge         = true;
         for (int c = 0; c < P_COLS; ++c) tiles[P_ROWS-1][c].is_weight_edge = true;
     }
@@ -480,61 +532,82 @@ public:
         computing     = true;
     }
 
-    void tick() {
+    // One compute step: RNG advance + systolic hop + tile compute + link
+    // latch (steps 1-4 below). Does NOT check for window-end -- callers that
+    // need multiple independent accumulate windows before draining (e.g.
+    // multiple K-blocks accumulated into one spatial-tile output, mirroring
+    // designs/sc_gemm_3d/inner_tile_2bit.sv's `acc` register, which only
+    // clears on clr_acc/reset -- never just from running another cycle) call
+    // this directly and invoke end_window() themselves once, after all
+    // K-blocks. tick() below is the original single-window auto-draining
+    // path, built on top of the same two primitives.
+    void step_compute() {
         ++cycle;
+        // (1) step each of the M input-bank and M weight-bank lanes once,
+        //     to get M threshold samples per side (one physical Sobol
+        //     generator per lane, not one generator stepped M times).
+        std::array<mag_t, M> ri, rw;
+        for (int m = 0; m < M; ++m) {
+            ri[m] = rng_input[m].step();
+            rw[m] = rng_weight[m].step();
+            systolic_stats.rng_advance += 2;
+        }
+
+        // (2) drive non-edge faces from the inter-tile flop latched LAST
+        //     cycle -- this IS the systolic hop (one tile per cycle).
+        //     Edge faces are generated inside compute() from the comparator.
+        for (int r = 0; r < P_ROWS; ++r)
+            for (int c = 0; c < P_COLS; ++c) {
+                if (!tiles[r][c].is_input_edge)  tiles[r][c].in_mag_bits = link_we_mag[r][c];
+                if (!tiles[r][c].is_weight_edge) tiles[r][c].w_mag_bits  = link_ns_mag[r][c];
+            }
+
+        // (3) every tile computes combinationally (reads its own bits only)
+        for (int r = 0; r < P_ROWS; ++r)
+            for (int c = 0; c < P_COLS; ++c)
+                tiles[r][c].compute(ri, rw);
+
+        // (4) latch this cycle's pass-through MAG bits into the downstream
+        //     flops (read next cycle).  Signs are stationary -> untouched.
+        for (int r = 0; r < P_ROWS; ++r)
+            for (int c = 0; c < P_COLS; ++c) {
+                if (c + 1 < P_COLS) {                 // input bits hop east
+                    for (int i = 0; i < N_H; ++i)
+                        for (int d = 0; d < K; ++d)
+                            for (int m = 0; m < M; ++m)
+                                if (link_we_mag[r][c+1][i][d][m] != tiles[r][c].in_mag_out[i][d][m])
+                                    ++systolic_stats.link_toggle;
+                    link_we_mag[r][c+1] = tiles[r][c].in_mag_out;
+                }
+                if (r > 0) {                          // weight bits hop north
+                    for (int j = 0; j < N_W; ++j)
+                        for (int d = 0; d < K; ++d)
+                            for (int m = 0; m < M; ++m)
+                                if (link_ns_mag[r-1][c][j][d][m] != tiles[r][c].w_mag_out[j][d][m])
+                                    ++systolic_stats.link_toggle;
+                    link_ns_mag[r-1][c] = tiles[r][c].w_mag_out;
+                }
+            }
+    }
+
+    // End the current accumulate window: drain each tile's oreg into
+    // drain_reg (removing the K*T*windows bias, see Tile::load_drain) and
+    // clear transient per-window state. Enters the drain-shift phase
+    // (computing = false), exactly as the original inline step 5 did.
+    void end_window(int windows = 1) {
+        for (auto& row : tiles) for (auto& t : row) t.load_drain(windows);
+        clear_window_transient();
+        computing     = false;
+        tick_in_phase = 0;
+    }
+
+    void tick() {
         if (computing) {
-            // (1) advance both RNGs M times to get M threshold samples per side
-            std::array<mag_t, M> ri, rw;
-            for (int m = 0; m < M; ++m) {
-                ri[m] = rng_input.step();
-                rw[m] = rng_weight.step();
-                systolic_stats.rng_advance += 2;
-            }
-
-            // (2) drive non-edge faces from the inter-tile flop latched LAST
-            //     cycle -- this IS the systolic hop (one tile per cycle).
-            //     Edge faces are generated inside compute() from the comparator.
-            for (int r = 0; r < P_ROWS; ++r)
-                for (int c = 0; c < P_COLS; ++c) {
-                    if (!tiles[r][c].is_input_edge)  tiles[r][c].in_mag_bits = link_we_mag[r][c];
-                    if (!tiles[r][c].is_weight_edge) tiles[r][c].w_mag_bits  = link_ns_mag[r][c];
-                }
-
-            // (3) every tile computes combinationally (reads its own bits only)
-            for (int r = 0; r < P_ROWS; ++r)
-                for (int c = 0; c < P_COLS; ++c)
-                    tiles[r][c].compute(ri, rw);
-
-            // (4) latch this cycle's pass-through MAG bits into the downstream
-            //     flops (read next cycle).  Signs are stationary -> untouched.
-            for (int r = 0; r < P_ROWS; ++r)
-                for (int c = 0; c < P_COLS; ++c) {
-                    if (c + 1 < P_COLS) {                 // input bits hop east
-                        for (int i = 0; i < N_H; ++i)
-                            for (int d = 0; d < K; ++d)
-                                for (int m = 0; m < M; ++m)
-                                    if (link_we_mag[r][c+1][i][d][m] != tiles[r][c].in_mag_out[i][d][m])
-                                        ++systolic_stats.link_toggle;
-                        link_we_mag[r][c+1] = tiles[r][c].in_mag_out;
-                    }
-                    if (r > 0) {                          // weight bits hop north
-                        for (int j = 0; j < N_W; ++j)
-                            for (int d = 0; d < K; ++d)
-                                for (int m = 0; m < M; ++m)
-                                    if (link_ns_mag[r-1][c][j][d][m] != tiles[r][c].w_mag_out[j][d][m])
-                                        ++systolic_stats.link_toggle;
-                        link_ns_mag[r-1][c] = tiles[r][c].w_mag_out;
-                    }
-                }
-
-            // (5) end of window after T/M ticks (M samples consumed per tick).
-            if (++tick_in_phase == T / M) {
-                for (auto& row : tiles) for (auto& t : row) t.load_drain();
-                clear_window_transient();
-                computing     = false;
-                tick_in_phase = 0;
-            }
+            step_compute();
+            // end of window after T/M ticks (M samples consumed per tick).
+            if (++tick_in_phase == T / M) end_window();
         } else {
+            ++cycle;
             // Drain: each tile-row's N_H lanes are independent east ports
             // (fed west-to-east so each shift_drain call gets a same-cycle
             // snapshot of what its west neighbor is sending); within a lane,
@@ -695,9 +768,13 @@ static void bipolar_matmul_demo() {
 // ---------------------------------------------------------------------------
 // Binary workload format (used when --binary-file is passed):
 //
-//   Header (ASCII, one line): "N_TILES=<n> N_CHUNKS=<c> A_ROWS=<r> W_COLS=<w> K=<k>\n"
-//   Data (raw binary, immediately after the newline):
-//     For each tile (N_TILES), for each chunk (N_CHUNKS):
+//   Header (ASCII, one line):
+//     "N_TILES=<n> N_CHUNKS=<c> A_ROWS=<r> W_COLS=<w> K=<k> K_BLOCKS=<kb>\n"
+//   K_BLOCKS defaults to 1 if omitted (old workload files still work
+//   unchanged).
+//
+//   Data (raw binary, immediately after the newline): for each tile
+//   (N_TILES), for each chunk (N_CHUNKS), for each K-block (K_BLOCKS):
 //       uint16_t  A_bnd[A_ROWS][K]   — magnitude boundaries (0..RNG_LEVELS-1)
 //       uint8_t   A_sgn[A_ROWS][K]   — sign bits (0=pos, 1=neg)
 //       uint16_t  W_bnd[W_COLS][K]
@@ -705,13 +782,25 @@ static void bipolar_matmul_demo() {
 //   (Little-endian; boundary fits in uint16 for MAG_BITS<=15, uint32 otherwise.
 //    Python packs with np.uint16 so both sides must agree on the width.)
 //
+//   One CHUNK is one independent accumulate window (fresh RNG reset/reseed),
+//   spanning K_BLOCKS*K of the GEMM's real reduction depth. Its K_BLOCKS are
+//   accumulated together into a single drain value -- the RNG does NOT reset
+//   between K-blocks within a chunk, matching designs/sc_gemm_3d/
+//   inner_tile_2bit.sv's `acc` register, which only clears on clr_acc/reset,
+//   never just from another cycle running. Each K-block after the first
+//   burns 2 throwaway RNG steps per lane before its accumulate cycles run,
+//   mirroring the RTL's 2-cycle pipeline-fill latency after an operand
+//   reload (see tb_gemm.sv's run_spatial_tile / sc_kernel.py's
+//   compute_spatial_tile, the RTL/numpy reference this mirrors).
+//
 //   Drain output (binary, written to stdout, after one ASCII header line):
 //     Header: "RESULT N_TILES=<n> N_CHUNKS=<c> A_ROWS=<r> W_COLS=<w>\n"
 //     Data:   int32_t drain[N_TILES][N_CHUNKS][A_ROWS][W_COLS]
+//     (One drain value per chunk, not per K-block.)
 
 static void parse_header(const std::string& line,
                          int& n_tiles, int& n_chunks,
-                         int& arows,   int& wcols, int& k) {
+                         int& arows,   int& wcols, int& k, int& k_blocks) {
     size_t pos = 0;
     while (pos < line.size()) {
         size_t eq = line.find('=', pos);
@@ -725,6 +814,7 @@ static void parse_header(const std::string& line,
         else if (key == "A_ROWS")   arows    = val;
         else if (key == "W_COLS")   wcols    = val;
         else if (key == "K")        k        = val;
+        else if (key == "K_BLOCKS") k_blocks = val;
         pos = (end == line.size()) ? end : end + 1;
     }
 }
@@ -732,10 +822,10 @@ static void parse_header(const std::string& line,
 static void run_workload_binary(const std::string& input_path) {
     constexpr int AROWS = P_ROWS * N_H;
     constexpr int WCOLS = P_COLS * N_W;
-    // Bytes per (tile, chunk) element in the packed binary stream:
+    // Bytes per (tile, chunk, K-block) element in the packed binary stream:
     //   uint16 A_bnd[AROWS][K]  +  uint8 A_sgn[AROWS][K]
     //   uint16 W_bnd[WCOLS][K]  +  uint8 W_sgn[WCOLS][K]
-    constexpr size_t ELEM_BYTES =
+    constexpr size_t KBLOCK_BYTES =
         size_t(AROWS) * K * 2 + size_t(AROWS) * K +
         size_t(WCOLS) * K * 2 + size_t(WCOLS) * K;
 
@@ -746,8 +836,8 @@ static void run_workload_binary(const std::string& input_path) {
     char hdr[512] = {};
     if (!std::fgets(hdr, sizeof(hdr), fin)) { std::fputs("empty file\n", stderr); std::exit(1); }
 
-    int n_tiles = 0, n_chunks = 0, arows = 0, wcols = 0, k = 0;
-    parse_header(std::string(hdr), n_tiles, n_chunks, arows, wcols, k);
+    int n_tiles = 0, n_chunks = 0, arows = 0, wcols = 0, k = 0, k_blocks = 1;
+    parse_header(std::string(hdr), n_tiles, n_chunks, arows, wcols, k, k_blocks);
 
     if (arows != AROWS || wcols != WCOLS || k != K) {
         std::fprintf(stderr,
@@ -756,6 +846,8 @@ static void run_workload_binary(const std::string& input_path) {
             arows, wcols, k, AROWS, WCOLS, K);
         std::exit(1);
     }
+
+    const size_t ELEM_BYTES = KBLOCK_BYTES * size_t(k_blocks);
 
     // Pre-read all binary data into memory so tiles can be processed in parallel.
     size_t n_elem = size_t(n_tiles) * n_chunks;
@@ -782,34 +874,51 @@ static void run_workload_binary(const std::string& input_path) {
         Systolic& sys = sys_pool[omp_get_thread_num()];
 
         for (int ch = 0; ch < n_chunks; ++ch) {
-            const uint8_t* p = raw.data() + (size_t(tile) * n_chunks + ch) * ELEM_BYTES;
-
-            const uint16_t* A_bnd = reinterpret_cast<const uint16_t*>(p);
-            const uint8_t*  A_sgn = p + AROWS * K * 2;
-            const uint16_t* W_bnd = reinterpret_cast<const uint16_t*>(A_sgn + AROWS * K);
-            const uint8_t*  W_sgn = reinterpret_cast<const uint8_t*>(W_bnd) + WCOLS * K * 2;
+            const uint8_t* chunk_base = raw.data() + (size_t(tile) * n_chunks + ch) * ELEM_BYTES;
 
             sys.reset_window_state();
-            sys.rng_input  = Sobol(SOBOL_V1.data());
-            sys.rng_weight = Sobol(SOBOL_V2.data());
+            sys.rng_input  = make_sobol_bank(SEED_BASE_IN, SEED_STRIDE_IN, SOBOL_V1.data());
+            sys.rng_weight = make_sobol_bank(SEED_BASE_W, SEED_STRIDE_W, SOBOL_V2.data());
 
-            std::array<mag_t, K> mag; std::array<bool, K> sgn;
-            for (int r = 0; r < AROWS; ++r) {
-                for (int d = 0; d < K; ++d) {
-                    mag[d] = mag_t(A_bnd[r * K + d]);
-                    sgn[d] = bool(A_sgn[r * K + d]);
-                }
-                sys.load_inputs(r, mag, sgn);
-            }
-            for (int c = 0; c < WCOLS; ++c) {
-                for (int d = 0; d < K; ++d) {
-                    mag[d] = mag_t(W_bnd[c * K + d]);
-                    sgn[d] = bool(W_sgn[c * K + d]);
-                }
-                sys.load_weights(c, mag, sgn);
-            }
+            for (int kb = 0; kb < k_blocks; ++kb) {
+                const uint8_t* p = chunk_base + size_t(kb) * KBLOCK_BYTES;
+                const uint16_t* A_bnd = reinterpret_cast<const uint16_t*>(p);
+                const uint8_t*  A_sgn = p + AROWS * K * 2;
+                const uint16_t* W_bnd = reinterpret_cast<const uint16_t*>(A_sgn + AROWS * K);
+                const uint8_t*  W_sgn = reinterpret_cast<const uint8_t*>(W_bnd) + WCOLS * K * 2;
 
-            for (int t = 0; t < T / M; ++t) sys.tick();
+                std::array<mag_t, K> mag; std::array<bool, K> sgn;
+                for (int r = 0; r < AROWS; ++r) {
+                    for (int d = 0; d < K; ++d) {
+                        mag[d] = mag_t(A_bnd[r * K + d]);
+                        sgn[d] = bool(A_sgn[r * K + d]);
+                    }
+                    sys.load_inputs(r, mag, sgn);
+                }
+                for (int c = 0; c < WCOLS; ++c) {
+                    for (int d = 0; d < K; ++d) {
+                        mag[d] = mag_t(W_bnd[c * K + d]);
+                        sgn[d] = bool(W_sgn[c * K + d]);
+                    }
+                    sys.load_weights(c, mag, sgn);
+                }
+
+                // Pipeline-fill skip between K-blocks (not before the first):
+                // discarded comparator output during these cycles never
+                // reaches an accumulator either way, so only the RNG state
+                // advance matters for bit-exactness -- see the format doc
+                // comment above.
+                if (kb > 0) {
+                    for (int f = 0; f < 2; ++f)
+                        for (int m = 0; m < M; ++m) {
+                            sys.rng_input[m].step();
+                            sys.rng_weight[m].step();
+                        }
+                }
+
+                for (int t = 0; t < T / M; ++t) sys.step_compute();
+            }
+            sys.end_window(k_blocks);
 
             int base = (tile * n_chunks + ch) * AROWS * WCOLS;
             for (int r = 0; r < AROWS; ++r) {
