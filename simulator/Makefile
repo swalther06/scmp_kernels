@@ -26,7 +26,16 @@ DEFINES := \
 #   make wl WL_ARGS="--granularity per_row --output results.csv"
 WL_ARGS ?=
 
-.PHONY: all gemm wl sweep clean
+# GEMM problem dims for the timeloop mapping search — override on the command
+# line, e.g.: make wl_sim PROB_M=2048 PROB_K=512
+PROB_M ?= 1024
+PROB_K ?= 1024
+PROB_N ?= 1024
+
+WORKLOAD_BIN ?= workload.bin
+MAP_ARGS     ?=
+
+.PHONY: all gemm wl sweep wl_sim clean
 
 all: gemm_sim.exe
 
@@ -42,7 +51,19 @@ wl: gemm_sim.exe
 sweep:
 	uv run sweep.py
 
+# Find the optimal timeloop mapping for this array config, then feed it
+# straight into the cycle-accurate sim as a --binary-file workload.
+wl_sim: gemm_sim.exe
+	uv run python3 find_mapping.py \
+		--M $(PROB_M) --K $(PROB_K) --N $(PROB_N) \
+		--p-rows $(CFG_P_ROWS) --p-cols $(CFG_P_COLS) \
+		--n-h $(CFG_N_H) --n-w $(CFG_N_W) \
+		--k-depth $(CFG_K) --m-parallel $(CFG_M) --mag-bits $(CFG_MAG_BITS) \
+		--workload-out $(WORKLOAD_BIN) $(MAP_ARGS)
+	./gemm_sim.exe --binary-file $(WORKLOAD_BIN)
+
 clean:
 	rm -f *.exe
 	rm -f *.out
 	rm -f *.csv
+	rm -f $(WORKLOAD_BIN)

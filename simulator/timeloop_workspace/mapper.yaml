@@ -1,0 +1,5 @@
+mapper:
+  algorithm: random-pruned
+  num-threads: 8
+  timeout: 1000
+  victory-condition: 500

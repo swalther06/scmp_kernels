@@ -111,7 +111,7 @@
 #define CFG_P_COLS 4                    // systolic tile cols (max output cols / window)
 #endif
 #ifndef CFG_STOC_LEN
-#define CFG_STOC_LEN (1 << (CFG_MAG_BITS + 1)) // bitstream length T; default 2^sc_prec (scmp default)
+#define CFG_STOC_LEN (1 << CFG_MAG_BITS) // bitstream length T; default 2^MAG_BITS = 2^(sc_prec-1)
 #endif
 #ifndef CFG_OWEN
 #define CFG_OWEN 0                       // 1 = per-lane Owen XOR scramble (decorrelate K lanes)
@@ -794,9 +794,20 @@ static void bipolar_matmul_demo() {
 //   compute_spatial_tile, the RTL/numpy reference this mirrors).
 //
 //   Drain output (binary, written to stdout, after one ASCII header line):
-//     Header: "RESULT N_TILES=<n> N_CHUNKS=<c> A_ROWS=<r> W_COLS=<w>\n"
-//     Data:   int32_t drain[N_TILES][N_CHUNKS][A_ROWS][W_COLS]
-//     (One drain value per chunk, not per K-block.)
+//     Header: "RESULT N_TILES=<n> N_CHUNKS=<c> A_ROWS=<r> W_COLS=<w> CYCLES=1\n"
+//     Data:   int32_t  drain [N_TILES][N_CHUNKS][A_ROWS][W_COLS]
+//             uint64_t cycles[N_TILES][N_CHUNKS]   -- real hardware cycles for
+//               that chunk's whole window: T/M ticks per K-block, +2 pipeline-
+//               fill cycles for each K-block after the first (see the
+//               K_BLOCKS note above), + P_COLS*N_W ticks for the drain-shift-
+//               out phase (this function reads drain_reg directly instead of
+//               physically running Tile::shift_drain -- see bipolar_matmul_demo
+//               for the code path that actually ticks the drain phase -- so
+//               those cycles are added in analytically rather than incurred).
+//     (One drain value AND one cycle count per chunk, not per K-block.)
+//     CYCLES=1 lets a reader detect whether the trailing cycles array is
+//     present (older parsers that only read the header's N_TILES/N_CHUNKS/
+//     A_ROWS/W_COLS prefix and the drain array are unaffected either way).
 
 static void parse_header(const std::string& line,
                          int& n_tiles, int& n_chunks,
@@ -859,11 +870,12 @@ static void run_workload_binary(const std::string& input_path) {
     std::fclose(fin);
 
     // Emit drain output header before the parallel section
-    std::printf("RESULT N_TILES=%d N_CHUNKS=%d A_ROWS=%d W_COLS=%d\n",
+    std::printf("RESULT N_TILES=%d N_CHUNKS=%d A_ROWS=%d W_COLS=%d CYCLES=1\n",
                 n_tiles, n_chunks, AROWS, WCOLS);
     std::fflush(stdout);
 
-    std::vector<int32_t> drain_out(n_elem * AROWS * WCOLS, 0);
+    std::vector<int32_t>  drain_out(n_elem * AROWS * WCOLS, 0);
+    std::vector<uint64_t> cycles_out(n_elem, 0);
 
     // One Systolic object per thread (each is stateful: RNG, PE registers).
     int max_threads = omp_get_max_threads();
@@ -877,6 +889,7 @@ static void run_workload_binary(const std::string& input_path) {
             const uint8_t* chunk_base = raw.data() + (size_t(tile) * n_chunks + ch) * ELEM_BYTES;
 
             sys.reset_window_state();
+            sys.cycle      = 0;   // per-chunk cycle count, not a running total across chunks
             sys.rng_input  = make_sobol_bank(SEED_BASE_IN, SEED_STRIDE_IN, SOBOL_V1.data());
             sys.rng_weight = make_sobol_bank(SEED_BASE_W, SEED_STRIDE_W, SOBOL_V2.data());
 
@@ -914,13 +927,20 @@ static void run_workload_binary(const std::string& input_path) {
                             sys.rng_input[m].step();
                             sys.rng_weight[m].step();
                         }
+                    sys.cycle += 2;   // the 2-cycle pipeline-fill latency itself
                 }
 
                 for (int t = 0; t < T / M; ++t) sys.step_compute();
             }
             sys.end_window(k_blocks);
+            // Drain-shift-out phase: this loop reads drain_reg directly rather
+            // than physically running Tile::shift_drain (see the format doc
+            // comment above), so add its P_COLS*N_W ticks in analytically.
+            sys.cycle += static_cast<uint64_t>(P_COLS) * N_W;
 
-            int base = (tile * n_chunks + ch) * AROWS * WCOLS;
+            int idx = tile * n_chunks + ch;
+            cycles_out[idx] = sys.cycle;
+            int base = idx * AROWS * WCOLS;
             for (int r = 0; r < AROWS; ++r) {
                 int tr = r / N_H, ti = r % N_H;
                 for (int c = 0; c < WCOLS; ++c) {
@@ -933,6 +953,7 @@ static void run_workload_binary(const std::string& input_path) {
     }
 
     std::fwrite(drain_out.data(), sizeof(int32_t), drain_out.size(), stdout);
+    std::fwrite(cycles_out.data(), sizeof(uint64_t), cycles_out.size(), stdout);
     std::fflush(stdout);
 }
 

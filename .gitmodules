@@ -1,0 +1,3 @@
+[submodule "simulator/timeloop"]
+	path = simulator/timeloop
+	url = git@github.com:NVlabs/timeloop.git

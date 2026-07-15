@@ -1,0 +1,20 @@
+architecture:
+  version: 0.2
+  subtree:
+  - name: system
+    attributes:
+      technology: 45nm
+    local:
+    - name: DRAM
+      class: DRAM
+    - name: GlobalBuffer
+      class: SRAM
+      attributes:
+        instances: 1
+        meshX: 1
+    - name: PE
+      class: intmac
+      attributes:
+        instances: 16
+        meshX: 4
+        datawidth: 8

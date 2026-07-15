@@ -1,0 +1,8 @@
+mapspace:
+  constraints:
+  - target: PE
+    type: spatial
+    factors: M=4 N=4
+  - target: PE
+    type: temporal
+    factors: K=4
