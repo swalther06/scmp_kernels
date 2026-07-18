@@ -1,5 +1,10 @@
 mapper:
-  algorithm: random-pruned
-  num-threads: 8
-  timeout: 1000
-  victory-condition: 500
+  version: 0.4
+  optimization_metrics:
+  - energy
+  algorithm: random_pruned
+  num_threads: 8
+  timeout: 15000
+  victory_condition: 300
+  live_status: false
+  diagnostics: true

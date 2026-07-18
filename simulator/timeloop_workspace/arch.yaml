@@ -1,20 +1,41 @@
+globals:
+  version: 0.4
+variables:
+  version: 0.4
+  global_cycle_seconds: 1.0e-09
 architecture:
-  version: 0.2
-  subtree:
-  - name: system
+  version: 0.4
+  nodes:
+  - !Container
+    name: system
     attributes:
-      technology: 45nm
-    local:
-    - name: DRAM
-      class: DRAM
-    - name: GlobalBuffer
-      class: SRAM
-      attributes:
-        instances: 1
-        meshX: 1
-    - name: PE
-      class: intmac
-      attributes:
-        instances: 16
-        meshX: 4
-        datawidth: 8
+      technology: "45nm"
+  - !Component
+    name: DRAM
+    class: DRAM
+    attributes:
+      width: 256
+      datawidth: 8
+      depth: 268435456
+  - !Component
+    name: GlobalBuffer
+    class: SRAM
+    attributes:
+      depth: 16384
+      width: 256
+      datawidth: 8
+  - !Container
+    name: PE
+    spatial:
+      meshX: 4
+      meshY: 4
+  - !Container
+    name: Klane
+    spatial:
+      meshX: 4
+  - !Component
+    name: MACC
+    class: sc_mac_inner
+    attributes:
+      mag_bits: 7
+      datawidth: 8

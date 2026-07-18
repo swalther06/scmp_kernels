@@ -1,8 +1,12 @@
-mapspace:
-  constraints:
-  - target: PE
-    type: spatial
-    factors: M=4 N=4
-  - target: PE
-    type: temporal
-    factors: K=4
+constraints:
+  targets:
+  - type: spatial
+    target: PE
+    factors: [M=4, N=4]
+    permutation: [N, M]
+    split: 1
+  - type: spatial
+    target: Klane
+    factors: [K=4]
+    permutation: [K]
+    split: 1

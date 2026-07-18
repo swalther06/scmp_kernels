@@ -20,5 +20,6 @@ dist/
 # Executables
 simulator/*.exe
 
-# Verification files (WIP)
-simulator/*.py
+# Output files
+simulator/timeloop_container_run/out
+simulator/timeloop_container_run/work
