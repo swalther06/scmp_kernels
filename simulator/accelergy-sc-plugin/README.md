@@ -1,87 +1,56 @@
 # accelergy-sc-plugin
 
-An Accelergy estimator plug-in for the **unary-stochastic-computing (SC) MAC**
-used by `gemm_cycle_accurate_sim.cpp` / `find_mapping.py`: a bit-serial AND-gate
-multiply feeding a shared accumulator, with stochastic-number generators (SNG)
-converting operands to length-T bitstreams.
+Accelergy estimators for the **PaYN stochastic-computing (SC) GEMM array**,
+modelled as **three components with three different action drivers** — so the
+mapper sees each energy term where it physically belongs:
 
-> **Status: skeleton.** The plug-in structure and Accelergy interface are real
-> and runnable, but the hardware coefficients in `sc_mac.py` (`E_*_BIT`, leakage,
-> area) are **placeholders**. Replace them with characterized numbers (RTL
-> synthesis / SPICE / SCArch `power_array_3d.sv`) before trusting absolute
-> energies. Until then it is useful for *relative* mapping comparison only.
+| estimator (file) | class / subclass | Timeloop level | action driver | maps to RTL |
+|---|---|---|---|---|
+| `SCMacInner` (`sc_mac.py`) | `sc_mac_inner` (compute) | arithmetic | per **MAC** (`compute`) | `InnerPE` / `InnerTile` |
+| `Peripheral` (`peripheral.py`) | `storage`/`peripheral` | operand path | per **operand read** | `sc_pe_peripheral` |
+| `SobolBank` (`sobol_bank.py`) | `storage`/`sobol_bank` | shared, `instances:1` | per **cycle** (`leak`) | `sobol_bank` ×2 |
 
-## Why a plug-in (vs hand-writing ERT tables)
+> **Status: skeleton.** `sc_mac_inner.compute` carries the **measured** inner
+> energy (3.543 pJ/MAC). `peripheral.read` and `sobol_bank.leak` are
+> **placeholders** (`E_READ_J` / `E_LEAK_PER_CYCLE_J = None` → per-bit guesses)
+> pending the `power_payn_array` PrimeTime run. Good for *relative* mapping
+> comparison until then.
 
-Accelergy still models the *entire non-novel* memory/interconnect hierarchy
-(SRAM global buffer, register file, DRAM) with its built-in CACTI/library
-estimators — often the dominant share of accelerator energy. This plug-in adds
-the *one* novel component: the SC PE. Encoding it as a parameterized estimator
-(vs a static ERT) means Accelergy re-evaluates it automatically as
-`find_mapping.py`'s DSE sweeps `mag_bits`, width, tech node, etc.
+## Why three drivers (not one lumped "outer")
 
-## The one SC-specific modelling rule
+The banks and peripheral scale with fundamentally different things — lumping
+them mis-models the mapping dependence:
 
-Timeloop counts **logical** MACs — one `compute` action per scalar
-multiply-accumulate, with no notion of a bitstream. So the length-T scaling of
-an SC MAC lives inside the per-`compute` *energy* here, **not** in the action
-count:
+- **Inner** (`sc_mac_inner`) → **per MAC**. Length-T stream scaling lives inside
+  the per-`compute` energy (Timeloop counts logical MACs, not stream bits), the
+  analogue of `apply_hardware_timing()` for cycles.
+- **Peripheral** → **per operand read**. Operands are *reused* (`a[h,k]` feeds a
+  whole output row), so conversions ≪ MACs, and reuse changes with the mapping.
+  This is the term that actually *moves the energy-optimal mapping*. It's a real
+  level in the operand path (keeps Inputs/Weights, bypasses Outputs).
+- **Sobol banks** → **per cycle, shared**. One RNG advance broadcasts to the
+  whole array, so bank energy is a fixed per-cycle cost independent of operand
+  count / MACs / array size. That doesn't fit a data level, so the banks bypass
+  all dataspaces and their per-cycle dynamic energy rides in `leak`
+  (`instances:1`). Verified: at 256³ this amortizes to ~0.024 pJ/MAC — which is
+  exactly *why sharing the banks is the architectural win*.
+
+## Characterizing the placeholders (next step)
+
+Run PrimeTime on PaYN's `power_payn_array` bench and bucket by instance:
 
 ```
-energy(compute) ≈ T · (AND-gate + accumulate + SNG) per-bit cost
+u_pe                  -> E_inner  ÷ (N_H·N_W·K) MACs      -> sc_mac.E_COMPUTE_J
+u_peripheral          -> E_periph ÷ (N_H+N_W)·K operands  -> peripheral.E_READ_J
+u_a_rng + u_w_rng     -> E_bank   ÷ window cycles          -> sobol_bank.E_LEAK_PER_CYCLE_J
 ```
-
-This is the exact analogue of what `find_mapping.apply_hardware_timing()` does
-for *cycles* (scaling by `cycles_per_mac_window`). Keep the T-factor in the ERT
-number and the mapper stays correct.
-
-## Actions exposed
-
-| action         | meaning                                                        |
-|----------------|----------------------------------------------------------------|
-| `compute`      | one full SC MAC (length-T stream multiply + accumulate)        |
-| `gated_compute`| operand zero/invalid, datapath gated: SNG/enable overhead only |
-| `leak`         | static leakage per global cycle                                |
-
-`compute`/`leak` match the v0.4 `intmac` action vocabulary Timeloop expects.
-(The `mac_random`/`mac_reused`/`mac_gated` names you may have seen belong to the
-older 2020-ispass *primitive* `intmac`; the reuse distinction here is the
-`n_sng_per_mac` attribute instead — 2.0 = both operands fresh, 1.0 = one stream
-reused, <1.0 = SNG shared across a row.)
+(cross-check `u_pe` pJ/MAC vs the standalone `power_inner_pe` run).
 
 ## Install
 
 ```bash
-cd accelergy-sc-plugin
-pip3 install .            # installs into share/accelergy/estimation_plug_ins/
+pip3 install .                 # -> share/accelergy/estimation_plug_ins/
 ```
 
-For a quick local test without pip, from a Python shell in this dir:
-`from sc_mac import SCMac; SCMac.quick_install_this_file()`.
-
-Verify Accelergy sees it:
-```bash
-accelergy --list-plug-ins    # sc_mac should appear
-```
-
-## Wire into the architecture
-
-In the arch that `find_mapping.build_arch_spec()` emits, change the `MACC`
-component from the built-in `intmac` to `sc_mac` and pass the SC knobs:
-
-```yaml
-- !Component
-  name: MACC
-  class: sc_mac
-  attributes:
-    mag_bits: 7          # T = 2**mag_bits
-    datawidth: 8         # mag_bits + sign
-    n_sng_per_mac: 1.0   # dataflow-dependent SNG reuse (see table above)
-    # technology + global_cycle_seconds are inherited from the System container
-```
-
-`technology` (→ tech node) is inherited from the `System` container's
-attributes; `global_cycle_seconds` is passed to `leak()` automatically by
-Accelergy. To have `find_mapping.py` emit this automatically, update
-`build_arch_spec()` to set `class: sc_mac` and the attributes above — ask and I
-can wire that in.
+`find_mapping.build_arch_spec()` already emits all three components (`MACC`,
+`Peripheral`, `SobolBank`); `make mapping` runs the whole flow in the container.

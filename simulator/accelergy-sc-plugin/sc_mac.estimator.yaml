@@ -3,4 +3,5 @@ version: 0.4          # Required version number
 # Relative paths to the Python files that contain Estimator classes.
 python_plug_ins:
 - sc_mac.py
-- rng_bank.py
+- peripheral.py
+- sobol_bank.py

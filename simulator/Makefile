@@ -62,7 +62,7 @@ INNER_TB     ?= designs/sc_gemm_3d/power_pe_single_int_2bit_lane_K32M8N4.sv
 INNER_SAIF   := build/$(INNER_TB)/dut.saif
 
 .PHONY: all gemm wl sweep wl_sim configs \
-        mapping mapping_baseline mapping_compare plugin_test inner_pe_energy \
+        mapping mapping_baseline mapping_compare inner_pe_energy \
         help clean
 
 all: gemm_sim.exe
@@ -95,11 +95,6 @@ wl_sim: gemm_sim.exe
 # ---------------------------------------------------------------------------
 # Accelergy plug-in + Timeloop energy-optimal mapping
 # ---------------------------------------------------------------------------
-
-# Sanity-check the SC Accelergy estimators load and return the measured numbers
-# (no container / Accelergy install needed).
-plugin_test:
-	python3 $(PLUGIN_DIR)/selftest.py
 
 # STEP 1: generate the 4 timeloopfe-v4 config files into $(CFG_DIR).
 # Override problem/array: make configs PROB_M=512 CFG_P_ROWS=2 ... ; GLB=0 for baseline.
@@ -162,7 +157,6 @@ help:
 	@echo "  wl               run the LLM workload through the simulator"
 	@echo "  sweep            run the DSE sweep"
 	@echo "  wl_sim           find_mapping.py (native mapper) -> binary workload -> sim"
-	@echo "  plugin_test      verify the SC Accelergy estimators (no container)"
 	@echo "  configs          generate the 4 timeloopfe-v4 YAML files -> $(CFG_DIR)/"
 	@echo "  mapping          energy-optimal GEMM mapping (configs + Timeloop, container)"
 	@echo "  mapping_baseline same, but simple-tiling baseline (GLB=0, no buffer)"

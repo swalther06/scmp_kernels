@@ -20,7 +20,8 @@ setup(
             f"share/accelergy/estimation_plug_ins/{PLUG_IN_NAME}",
             [
                 "sc_mac.py",
-                "rng_bank.py",
+                "peripheral.py",
+                "sobol_bank.py",
                 "sc_mac.estimator.yaml",
             ],
         ),

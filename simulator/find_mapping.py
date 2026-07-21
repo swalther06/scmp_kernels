@@ -212,11 +212,15 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
     pytimeloop.timeloopfe.v4 -- NOT the native timeloop-mapper binary. The two
     have different schemas; this file targets the one that actually runs here.
 
-    The perimeter SNG (rng_bank) is deliberately NOT a node: timeloopfe rejects
-    a custom *storage* class, and the outer/SNG energy is mapping-invariant
-    under the fixed outer=1.5x-inner model, so it is added post-hoc rather than
-    modelled as a level. (`sc_mac_inner` is a *compute* class -- accepted once
-    the container registers it in COMPUTE_CLASSES; see the run driver.)
+    Three SC energy components (PaYN structure), each with its own action driver:
+      - MACC (sc_mac_inner): INNER compute, per MAC.
+      - Peripheral (peripheral): the binary->stochastic comparators, per operand
+        READ (a level in the operand path -> mapping-dependent via reuse).
+      - SobolBank (sobol_bank): the shared RNG, per CYCLE (leak). Not in the
+        operand dataflow, so it bypasses all dataspaces and only contributes
+        leak; instances=1 (broadcast to the whole array).
+    (`sc_mac_inner` is a *compute* class -- accepted once the container registers
+    it in COMPUTE_CLASSES; peripheral/sobol_bank parse as storage levels.)
     """
     mesh_y = arch.p_rows * arch.n_h        # spatial-M extent (mesh rows)
     mesh_x = arch.p_cols * arch.n_w        # spatial-N extent (mesh cols)
@@ -245,6 +249,31 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
             "attributes": {"depth": 16384, "width": 256, "datawidth": 8},
         }))
     nodes += [
+        # OUTER (shared): Sobol RNG banks. Carry no operand data -- just per-cycle
+        # side energy billed as `leak`. instances:1 (broadcast array-wide); bypass
+        # every dataspace so it holds nothing. Energy from the sobol_bank estimator.
+        # class: storage (a recognized Timeloop storage class) + subclass names
+        # the Accelergy estimator (like the stock `storage`/`aladdin_register`).
+        Tagged("!Component", {
+            "name": "SobolBank",
+            "class": "storage",
+            "subclass": "sobol_bank",
+            "attributes": {"instances": 1, "depth": 1, "width": 8, "datawidth": 8},
+            "constraints": {"dataspace": {
+                "bypass": FlowList(["Inputs", "Weights", "Outputs"])}},
+        }),
+        # OUTER (per-operand): binary->stochastic conversion. A level in the
+        # operand path -- keeps Inputs/Weights, bypasses Outputs -- so Timeloop
+        # bills its `read` per operand delivered (mapping-dependent via reuse).
+        Tagged("!Component", {
+            "name": "Peripheral",
+            "class": "storage",
+            "subclass": "peripheral",
+            "attributes": {"depth": 64, "width": 8, "datawidth": 8},
+            "constraints": {"dataspace": {
+                "keep": FlowList(["Inputs", "Weights"]),
+                "bypass": FlowList(["Outputs"])}},
+        }),
         # 2D output-tile mesh: M -> rows (meshY), N -> cols (meshX).
         Tagged("!Container", {
             "name": "PE",

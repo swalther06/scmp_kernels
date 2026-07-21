@@ -24,6 +24,30 @@ architecture:
       depth: 16384
       width: 256
       datawidth: 8
+  - !Component
+    name: SobolBank
+    class: storage
+    subclass: sobol_bank
+    attributes:
+      instances: 1
+      depth: 1
+      width: 8
+      datawidth: 8
+    constraints:
+      dataspace:
+        bypass: [Inputs, Weights, Outputs]
+  - !Component
+    name: Peripheral
+    class: storage
+    subclass: peripheral
+    attributes:
+      depth: 64
+      width: 8
+      datawidth: 8
+    constraints:
+      dataspace:
+        keep: [Inputs, Weights]
+        bypass: [Outputs]
   - !Container
     name: PE
     spatial:
