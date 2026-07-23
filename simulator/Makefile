@@ -34,6 +34,12 @@ WL_ARGS ?=
 PROB_M ?= 1024
 PROB_K ?= 1024
 PROB_N ?= 1024
+# SC stream length L (mixed-precision axis). 128 = the E_COMPUTE_J reference.
+STREAM_LEN ?= 128
+
+# Mixed-precision trace to aggregate into per-(shape, L) bundles (step 1).
+TRACE      ?= sc_traces/trace_mp_cosine_avg32_percall.jsonl
+BUNDLE_OUT ?= $(TRACE:_percall.jsonl=_bundles.csv)
 
 WORKLOAD_BIN ?= workload.bin
 MAP_ARGS     ?=
@@ -61,7 +67,7 @@ INNER_TARGET ?= NanGate45/INNER_PE_K32M8N4
 INNER_TB     ?= designs/sc_gemm_3d/power_pe_single_int_2bit_lane_K32M8N4.sv
 INNER_SAIF   := build/$(INNER_TB)/dut.saif
 
-.PHONY: all gemm wl sweep wl_sim configs \
+.PHONY: all gemm wl sweep wl_sim trace_breakdown configs \
         mapping mapping_baseline mapping_compare inner_pe_energy \
         help clean
 
@@ -96,6 +102,13 @@ wl_sim: gemm_sim.exe
 # Accelergy plug-in + Timeloop energy-optimal mapping
 # ---------------------------------------------------------------------------
 
+# STEP 0: aggregate an SC-matmul trace into per-(shape, stream-length) bundles.
+# Prints the per-shape L breakdown and writes the bundle CSV (input to step 3).
+#   make trace_breakdown
+#   make trace_breakdown TRACE=sc_traces/trace_mp_cosine_avg48_percall.jsonl
+trace_breakdown:
+	python3 trace_to_bundles.py $(TRACE) -o $(BUNDLE_OUT)
+
 # STEP 1: generate the 4 timeloopfe-v4 config files into $(CFG_DIR).
 # Override problem/array: make configs PROB_M=512 CFG_P_ROWS=2 ... ; GLB=0 for baseline.
 configs:
@@ -103,7 +116,8 @@ configs:
 		--M $(PROB_M) --N $(PROB_N) --K $(PROB_K) \
 		--p-rows $(CFG_P_ROWS) --p-cols $(CFG_P_COLS) \
 		--n-h $(CFG_N_H) --n-w $(CFG_N_W) \
-		--k-depth $(CFG_K) --m-parallel $(CFG_M) --mag-bits $(CFG_MAG_BITS) $(NOGLB)
+		--k-depth $(CFG_K) --m-parallel $(CFG_M) --mag-bits $(CFG_MAG_BITS) \
+		--stream-length $(STREAM_LEN) $(NOGLB)
 
 # STEP 2: run Timeloop+Accelergy (container) on the generated configs.
 # Energy-optimal mapping with the measured SC-PE energy. Results in $(TL_DIR)/out/.
@@ -117,7 +131,7 @@ mapping: configs
 	@cp -r $(PLUGIN_DIR) $(TL_DIR)/work/plugin
 	@cp $(TL_DIR)/run.py $(TL_DIR)/work/run.py
 	@chmod -R 777 $(TL_DIR)/work
-	docker run --rm -v $(CURDIR)/$(TL_DIR)/work:/work $(TL_IMG) \
+	docker run --rm -e SC_STREAM_LENGTH=$(STREAM_LEN) -v $(CURDIR)/$(TL_DIR)/work:/work $(TL_IMG) \
 		bash -lc 'python3 /work/run.py /work/configs /work/out' 2>&1 \
 		| grep -avE 's6-|cont-init|services\.d|fix-attrs|adduser|usermod|User (uid|gid)|Jupter|jupyter|token|lab\?|Serving|open this file|127\.0\.0\.1|^-+$$|^ *$$' || true
 	@rm -rf $(TL_DIR)/out && cp -r $(TL_DIR)/work/out $(TL_DIR)/out
@@ -157,6 +171,7 @@ help:
 	@echo "  wl               run the LLM workload through the simulator"
 	@echo "  sweep            run the DSE sweep"
 	@echo "  wl_sim           find_mapping.py (native mapper) -> binary workload -> sim"
+	@echo "  trace_breakdown  aggregate an SC trace -> per-(shape,L) bundle CSV (TRACE=...)"
 	@echo "  configs          generate the 4 timeloopfe-v4 YAML files -> $(CFG_DIR)/"
 	@echo "  mapping          energy-optimal GEMM mapping (configs + Timeloop, container)"
 	@echo "  mapping_baseline same, but simple-tiling baseline (GLB=0, no buffer)"

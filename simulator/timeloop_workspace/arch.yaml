@@ -63,3 +63,4 @@ architecture:
     attributes:
       mag_bits: 7
       datawidth: 8
+      stream_length: 128

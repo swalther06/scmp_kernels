@@ -12,12 +12,12 @@ a whole output row, w[v,k] a whole column) means far fewer conversions than MACs
 and better temporal reuse lowers it further. This is the term that actually moves
 the energy-optimal mapping.
 
-Energies are MEASURED ONLY -- there is no analytical fallback. Set E_READ_J from
-the power_payn_array PrimeTime run:
-    E_READ_J = (u_peripheral window energy) / (operand-reads in window)
-             = (u_peripheral window energy) / ((N_H + N_W) * K)
-Until it is set, the estimator raises so an uncharacterized number can never
-silently reach the ERT.
+Energies are MEASURED ONLY -- one entry per stream length L (no interpolation).
+From a power_payn_array PT run at each SC_T:
+    E_READ_J_BY_L[L] = (u_peripheral dynamic energy) / ((N_H + N_W) * K operands)
+read() picks the entry for the run's stream length (via the SC_STREAM_LENGTH env
+var, since a storage component can't take a stream_length attribute); an unset L
+raises so an uncharacterized number can never silently reach the ERT.
 """
 
 from accelergy.plug_in_interface.estimator import (
@@ -31,11 +31,20 @@ import os
 
 
 REF_TECH_NM = 45.0
-LEAK_POWER_W = None    # TODO
 AREA_PER_LANE_UM2 = 4.0   # rough estimate, maybe useful for area comarison [um^2]
 
-# MEASURED, from PrimeTime: (u_peripheral energy) / ((N_H+N_W)*K operand-reads).
-E_READ_J = None  # TODO: fill in from the power_payn_array PT run
+E_READ_J_BY_L = {
+    16: None, 32: None, 48: None, 64: None, 96: None, 128: None, 192: None,
+}
+# peripheral leakage POWER [W] -- static, so L-independent (one value).
+LEAK_POWER_W = None    # TODO
+
+
+def _current_L() -> int:
+    """The run's SC stream length. The peripheral is a *storage* component, so it
+    can't take a `stream_length` attribute (strict StorageAttributes); the driver
+    passes it via the SC_STREAM_LENGTH env var (make mapping STREAM_LEN=...)."""
+    return int(os.environ.get("SC_STREAM_LENGTH", "128"))
 
 
 class EnergyNotCharacterized(RuntimeError):
@@ -75,12 +84,16 @@ class Peripheral(Estimator):
 
     @actionDynamicEnergy
     def read(self) -> float:
-        """Energy to convert one operand into its stochastic stream."""
-        if E_READ_J is None:
+        """Energy to convert one operand into its stochastic stream at length L."""
+        L = _current_L()
+        e = E_READ_J_BY_L.get(L)
+        if e is None:
             raise EnergyNotCharacterized(
-                "peripheral.read energy is not characterized."
+                f"peripheral.read energy for stream length L={L} is not "
+                f"characterized. Set E_READ_J_BY_L[{L}] in peripheral.py from the "
+                f"power_payn_array PT run at SC_T={L}."
             )
-        return E_READ_J
+        return e
 
     # Alias in case Timeloop bills operand delivery through this level as `write`.
     @actionDynamicEnergy

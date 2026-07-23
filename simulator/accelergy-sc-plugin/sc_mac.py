@@ -10,11 +10,11 @@ Action driver: `compute`, once per logical MAC. Timeloop counts logical MACs and
 has no notion of a bitstream, so the length-T stream scaling lives INSIDE this
 per-`compute` energy (the cycle-side analogue of apply_hardware_timing()).
 
-Energies are MEASURED ONLY -- there is no analytical fallback. Set E_COMPUTE_J
-from the PrimeTime run:
-    E_COMPUTE_J = (u_pe window energy) / (N_H * N_W * K MACs)
-Until it is set, the estimator raises so an uncharacterized number can never
-silently reach the ERT.
+Energies are MEASURED ONLY -- there is no analytical fallback, and one entry per
+stream length L (no interpolation). From a power_payn_array PT run at each SC_T:
+    E_COMPUTE_J_BY_L[L] = (u_pe dynamic energy) / (N_H * N_W * K MACs)
+compute() picks the entry for the run's stream length; an unset L raises so an
+uncharacterized number can never silently reach the ERT.
 """
 
 from accelergy.plug_in_interface.estimator import (
@@ -28,17 +28,13 @@ import os
 
 
 REF_TECH_NM = 45.0
-LEAK_POWER_W = None     # TODO 
 AREA_PER_BIT_UM2 = 2.0    # crude area proxy                             [um^2]
 
-# MEASURED, from PrimeTime: (u_pe energy) / (N_H*N_W*K MACs), in Joules.
-#
-# Current value: 3.543 pJ/MAC (dynamic), back-annotated DC report_power on
-# pe_single_int_2bit_lane_K32M8N4 (ASTRAEA, NanGate45, synth-level, 2.5ns,
-# random-operand SAIF over 131072 MACs / 11.52us). SNG-free, inner datapath only.
-# NOTE: this is the ASTRAEA PE at 45nm -- re-characterize against PaYN's InnerPE
-# (TSMC22, `SC_INNER_PE` / `u_pe` in power_payn_array) before trusting it.
-E_COMPUTE_J = 3.543e-12
+E_COMPUTE_J_BY_L = {
+    16: None, 32: None, 48: None, 64: None, 96: None, 128: None, 192: None,
+}
+# PE leakage POWER [W] -- static, so L-independent (one value).
+LEAK_POWER_W = None     # TODO
 
 
 class EnergyNotCharacterized(RuntimeError):
@@ -65,9 +61,11 @@ class SCMacInner(Estimator):
         technology,
         mag_bits: int = 7,
         datawidth: int = 8,
+        stream_length: int = 128,
     ):
         self.mag_bits = int(mag_bits)
         self.datawidth = int(datawidth)
+        self.stream_length = int(stream_length)
         self.tech_nm = _tech_nm(technology)
         assert self.mag_bits >= 1, f"mag_bits {mag_bits} must be >= 1"
 
@@ -76,12 +74,16 @@ class SCMacInner(Estimator):
 
     @actionDynamicEnergy
     def compute(self) -> float:
-        """Energy of one logical inner MAC (length-T stream: AND+popcount+accum)."""
-        if E_COMPUTE_J is None:
+        """Energy of one logical inner MAC at this run's stream length L."""
+        L = self.stream_length
+        e = E_COMPUTE_J_BY_L.get(L)
+        if e is None:
             raise EnergyNotCharacterized(
-                "sc_mac_inner.compute energy is not characterized."
+                f"sc_mac_inner.compute energy for stream length L={L} is not "
+                f"characterized. Set E_COMPUTE_J_BY_L[{L}] in sc_mac.py from the "
+                f"power_payn_array PT run at SC_T={L}."
             )
-        return E_COMPUTE_J
+        return e
 
     def leak(self, global_cycle_seconds: float) -> float:
         if LEAK_POWER_W is None:

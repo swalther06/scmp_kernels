@@ -67,6 +67,7 @@ class ArchConfig:
     k_depth: int = 4     # dot-product lane width per PE (reduction dim, temporal/spatial-K)
     m_parallel: int = 1  # bitstream samples processed per lane per cycle (CFG_M)
     mag_bits: int = 7    # magnitude precision (sets T = 2^mag_bits by default)
+    stream_length: int = 128 # SC stream length L (its own DSE axis for mixed precision)
 
 
 def stream_length(arch: ArchConfig) -> int:
@@ -291,6 +292,7 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
             "attributes": {
                 "mag_bits": arch.mag_bits,
                 "datawidth": arch.mag_bits + 1,
+                "stream_length": arch.stream_length,
             },
         }),
     ]
@@ -641,6 +643,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k-depth", type=int, default=4, help="matches CFG_K")
     p.add_argument("--m-parallel", type=int, default=1, help="matches CFG_M")
     p.add_argument("--mag-bits", type=int, default=7, help="matches CFG_MAG_BITS")
+    p.add_argument("--stream-length", type=int, default=128,
+                    help="SC stream length L (mixed-precision axis; scales compute/read energy)")
     p.add_argument("--work-dir", type=Path, default=Path("timeloop_workspace"),
                     help="where timeloop problem/arch/mapper YAML + outputs go")
     p.add_argument("--workload-out", type=Path, default=Path("workload.bin"),
@@ -660,6 +664,7 @@ def main() -> None:
         p_rows=args.p_rows, p_cols=args.p_cols,
         n_h=args.n_h, n_w=args.n_w,
         k_depth=args.k_depth, m_parallel=args.m_parallel, mag_bits=args.mag_bits,
+        stream_length=args.stream_length,
     )
 
     if args.emit_configs:
