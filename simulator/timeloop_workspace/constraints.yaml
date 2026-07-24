@@ -2,11 +2,11 @@ constraints:
   targets:
   - type: spatial
     target: PE
-    factors: [M=4, N=4]
+    factors: [M=8, N=8]
     permutation: [N, M]
     split: 1
   - type: spatial
     target: Klane
-    factors: [K=4]
+    factors: [K=8]
     permutation: [K]
     split: 1

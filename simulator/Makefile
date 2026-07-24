@@ -6,13 +6,15 @@ CXXFLAGS := -std=c++17 -O3 -march=native -fopenmp -Wall -Wextra
 
 # Architecture knobs — override on the command line, e.g.:
 #   make CFG_K=8 CFG_P_ROWS=2 CFG_M=4
+# Defaults describe the characterized k8m16n8 PE (K=8, M=16, N_H=N_W=8); the
+# plug-in energies (accelergy-sc-plugin) are measured at this shape and L=128.
 CFG_MAG_BITS ?= 7
-CFG_K        ?= 4
-CFG_P_ROWS   ?= 4
-CFG_P_COLS   ?= 4
-CFG_N_H      ?= 1
-CFG_N_W      ?= 1
-CFG_M        ?= 1
+CFG_K        ?= 8
+CFG_P_ROWS   ?= 1
+CFG_P_COLS   ?= 1
+CFG_N_H      ?= 8
+CFG_N_W      ?= 8
+CFG_M        ?= 16
 CFG_OWEN     ?= 0
 
 DEFINES := \
@@ -37,9 +39,22 @@ PROB_N ?= 1024
 # SC stream length L (mixed-precision axis). 128 = the E_COMPUTE_J reference.
 STREAM_LEN ?= 128
 
+# GlobalBuffer model. Bandwidth (bits/cycle) is DERIVED from the array so it never
+# stalls (GLB_READ_BW overrides); banks x ports split the bandwidth row. Capacity
+# is DETERMINED by the real on-chip SRAM size GLB_SIZE_KB (KB) -> depth, not set.
+GLB_BANKS   ?= 1
+GLB_PORTS   ?= 1
+GLB_READ_BW ?=
+GLB_SIZE_KB ?= 256
+GLB_BW_FLAG := $(if $(GLB_READ_BW),--glb-read-bw $(GLB_READ_BW),)
+
 # Mixed-precision trace to aggregate into per-(shape, L) bundles (step 1).
 TRACE      ?= sc_traces/trace_mp_cosine_avg32_percall.jsonl
 BUNDLE_OUT ?= $(TRACE:_percall.jsonl=_bundles.csv)
+# Bundle -> energy rollup (step 3). M_REP = representative per-tier M each mapping
+# runs at; BUNDLE_CSV defaults to what trace_breakdown wrote.
+BUNDLE_CSV ?= $(BUNDLE_OUT)
+M_REP      ?= 512
 
 WORKLOAD_BIN ?= workload.bin
 MAP_ARGS     ?=
@@ -68,7 +83,7 @@ INNER_TB     ?= designs/sc_gemm_3d/power_pe_single_int_2bit_lane_K32M8N4.sv
 INNER_SAIF   := build/$(INNER_TB)/dut.saif
 
 .PHONY: all gemm wl sweep wl_sim trace_breakdown configs \
-        mapping mapping_baseline mapping_compare inner_pe_energy \
+        mapping mapping_baseline mapping_compare bundle_energy inner_pe_energy \
         help clean
 
 all: gemm_sim.exe
@@ -117,7 +132,9 @@ configs:
 		--p-rows $(CFG_P_ROWS) --p-cols $(CFG_P_COLS) \
 		--n-h $(CFG_N_H) --n-w $(CFG_N_W) \
 		--k-depth $(CFG_K) --m-parallel $(CFG_M) --mag-bits $(CFG_MAG_BITS) \
-		--stream-length $(STREAM_LEN) $(NOGLB)
+		--stream-length $(STREAM_LEN) \
+		--glb-banks $(GLB_BANKS) --glb-ports $(GLB_PORTS) \
+		--glb-size-kb $(GLB_SIZE_KB) $(GLB_BW_FLAG) $(NOGLB)
 
 # STEP 2: run Timeloop+Accelergy (container) on the generated configs.
 # Energy-optimal mapping with the measured SC-PE energy. Results in $(TL_DIR)/out/.
@@ -142,6 +159,17 @@ mapping: configs
 # Simple-tiling baseline (no on-chip buffer). Compare energy to `make mapping`.
 mapping_baseline:
 	@$(MAKE) mapping GLB=0
+
+# STEP 3: mixed-precision model energy. For each (shape,L) tier in the bundle CSV,
+# run one mapping, weight energy/MAC by the tier's MAC count, and summarize
+# (per-shape, per-component, model total + latency -> $(BUNDLE_CSV:.csv=_energy.csv)).
+# Needs `make trace_breakdown` first. One `make mapping` per tier (~23) -> minutes.
+#   make bundle_energy
+#   make bundle_energy BUNDLE_CSV=... M_REP=256 GLB_SIZE_KB=512
+#   make bundle_energy MAP_ARGS=--dry-run     # preview tiers/weights only
+bundle_energy:
+	python3 bundle_energy.py $(BUNDLE_CSV) --m-rep $(M_REP) \
+		--glb-size-kb $(GLB_SIZE_KB) $(MAP_ARGS)
 
 # Run both and print the total energy each achieved (optimal vs simple tiling).
 mapping_compare:
@@ -176,6 +204,7 @@ help:
 	@echo "  mapping          energy-optimal GEMM mapping (configs + Timeloop, container)"
 	@echo "  mapping_baseline same, but simple-tiling baseline (GLB=0, no buffer)"
 	@echo "  mapping_compare  run both and print the energy comparison"
+	@echo "  bundle_energy    mixed-precision model energy: map each (shape,L) tier, weight by MACs"
 	@echo "  inner_pe_energy  characterize inner-PE pJ/MAC via ASTRAEA RTL (needs EDA env)"
 	@echo "  clean            remove build artifacts + mapping outputs"
 	@echo ""

@@ -18,6 +18,6 @@ problem:
       - [[N]]
       read_write: true
   instance:
-    M: 1024
-    K: 1024
-    N: 1024
+    M: 4096
+    K: 72
+    N: 256

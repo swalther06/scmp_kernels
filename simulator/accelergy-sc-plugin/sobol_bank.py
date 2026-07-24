@@ -12,11 +12,11 @@ is carried in `leak` -- mechanically leak = energy/cycle/instance, which is the
 banks' profile. Model them as ONE shared component (instances: 1). read/write
 are ~0 (they are not a level in the operand dataflow).
 
-Energies are MEASURED ONLY -- there is no analytical fallback. Set
-E_LEAK_PER_CYCLE_J from the power_payn_array PrimeTime run:
-    E_LEAK_PER_CYCLE_J = (u_a_rng + u_w_rng window energy) / (window cycles)
-Until it is set, the estimator raises so an uncharacterized number can never
-silently reach the ERT.
+FOR NOW this estimator is ZEROED: the characterization gave the Sobol cost only
+as a per-MAC bucket (0.028485 pJ/MAC @ L=128), not a per-cycle number, so it is
+folded into sc_mac_inner.compute (see sc_mac.py header) rather than billed as
+leak here. Splitting it back out needs a per-cycle (dynamic/leak) measurement --
+until then leak returns 0 to avoid double-counting the value already in compute.
 """
 
 from accelergy.plug_in_interface.estimator import (
@@ -33,17 +33,11 @@ REF_TECH_NM = 45.0
 N_BANKS = 2               # A-bank + W-bank
 AREA_PER_BIT_UM2 = 6.0    # rough area estimate per generator bit, maybe useful later [um^2]
 
-# MEASURED, from PrimeTime: (u_a_rng + u_w_rng energy) / (window cycles).
-E_LEAK_PER_CYCLE_J = None  # TODO: fill in from the power_payn_array PT run
-
-
-class EnergyNotCharacterized(RuntimeError):
-    """Raised when a measured PrimeTime energy has not been filled in yet.
-
-    Deliberate: this plug-in has no analytical fallback, so an uncharacterized
-    number can never silently reach the ERT. Accelergy treats a raised error as
-    "this estimator cannot estimate" and will report it if nothing else can.
-    """
+# The Sobol RNG energy (0.028485 pJ/MAC @ L=128) is currently folded into
+# sc_mac_inner.compute (see sc_mac.py header): the characterization gave a
+# per-MAC bucket, not a per-cycle number, so it can't be billed as leak here
+# without a cycles/MAC ratio. Zeroed to avoid double-counting for now.
+E_LEAK_PER_CYCLE_J = 0.0
 
 
 def _tech_nm(technology) -> float:
@@ -71,11 +65,8 @@ class SobolBank(Estimator):
         return self.tech_nm / REF_TECH_NM
 
     def leak(self, global_cycle_seconds: float) -> float:
-        """Per-cycle dynamic energy of the always-on shared banks (see docstring)."""
-        if E_LEAK_PER_CYCLE_J is None:
-            raise EnergyNotCharacterized(
-                "sobol_bank.leak energy is not characterized."
-            )
+        """Per-cycle energy of the shared banks -- folded into sc_mac_inner.compute
+        for now (see module header), so zero here to avoid double-counting."""
         return E_LEAK_PER_CYCLE_J
 
     # The banks are not a data level -- read/write/update cost nothing here

@@ -7,14 +7,15 @@ comparators, charged per operand read) and `sobol_bank` (the shared RNG, charged
 per cycle). See find_mapping.build_arch_spec.
 
 Action driver: `compute`, once per logical MAC. Timeloop counts logical MACs and
-has no notion of a bitstream, so the length-T stream scaling lives INSIDE this
+has no notion of a bitstream, so the length-L stream scaling lives INSIDE this
 per-`compute` energy (the cycle-side analogue of apply_hardware_timing()).
 
-Energies are MEASURED ONLY -- there is no analytical fallback, and one entry per
-stream length L (no interpolation). From a power_payn_array PT run at each SC_T:
-    E_COMPUTE_J_BY_L[L] = (u_pe dynamic energy) / (N_H * N_W * K MACs)
-compute() picks the entry for the run's stream length; an unset L raises so an
-uncharacterized number can never silently reach the ERT.
+Energy model (FOR NOW): a single measured per-MAC value at L_REF=128 on the
+k8m16n8 PE, scaled LINEARLY with stream length -- E(L) = E_REF * L / L_REF. The
+characterization gave four per-MAC buckets (core / conversion / Sobol / shared)
+but NO dynamic-vs-leakage split, so all four are lumped into this per-`compute`
+action (the peripheral and sobol_bank estimators are correspondingly zeroed to
+avoid double-counting). See E_COMPUTE_REF_J below.
 """
 
 from accelergy.plug_in_interface.estimator import (
@@ -30,20 +31,24 @@ import os
 REF_TECH_NM = 45.0
 AREA_PER_BIT_UM2 = 2.0    # crude area proxy                             [um^2]
 
-E_COMPUTE_J_BY_L = {
-    16: None, 32: None, 48: None, 64: None, 96: None, 128: None, 192: None,
-}
-# PE leakage POWER [W] -- static, so L-independent (one value).
-LEAK_POWER_W = None     # TODO
+# --- Measured energy (k8m16n8 PE, PrimeTime) --------------------------------
+# Reference stream length the buckets below were characterized at. Energy scales
+# LINEARLY with L for now: E(L) = E_REF * L / L_REF (a first-order stand-in until
+# per-L measurements exist).
+L_REF = 128
 
-
-class EnergyNotCharacterized(RuntimeError):
-    """Raised when a measured PrimeTime energy has not been filled in yet.
-
-    Deliberate: this plug-in has no analytical fallback, so an uncharacterized
-    number can never silently reach the ERT. Accelergy treats a raised error as
-    "this estimator cannot estimate" and will report it if nothing else can.
-    """
+# Per-MAC energy buckets at L_REF [Joules]. There was NO dynamic-vs-leakage
+# split -- each is a TOTAL per-MAC value (dynamic + leakage lumped). Timeloop's
+# only per-MAC action is `compute`, and per-MAC is exactly how these are
+# normalized, so all four are summed into compute() and leak() charges nothing.
+# The peripheral/sobol_bank estimators are zeroed (their share lives here) to
+# avoid double-counting; the buckets stay named for provenance and re-splitting.
+PJ = 1e-12
+E_CORE_J   = 0.601948 * PJ   # inner compute datapath (popcount + sum-tree + accumulate)
+E_CONV_J   = 0.047377 * PJ   # binary->stochastic conversion (peripheral comparators)
+E_SOBOL_J  = 0.028485 * PJ   # shared Sobol RNG banks
+E_SHARED_J = 0.003626 * PJ   # shared / top-level glue
+E_COMPUTE_REF_J = E_CORE_J + E_CONV_J + E_SOBOL_J + E_SHARED_J  # 0.681436 pJ/MAC @ L_REF
 
 
 def _tech_nm(technology) -> float:
@@ -74,23 +79,18 @@ class SCMacInner(Estimator):
 
     @actionDynamicEnergy
     def compute(self) -> float:
-        """Energy of one logical inner MAC at this run's stream length L."""
-        L = self.stream_length
-        e = E_COMPUTE_J_BY_L.get(L)
-        if e is None:
-            raise EnergyNotCharacterized(
-                f"sc_mac_inner.compute energy for stream length L={L} is not "
-                f"characterized. Set E_COMPUTE_J_BY_L[{L}] in sc_mac.py from the "
-                f"power_payn_array PT run at SC_T={L}."
-            )
-        return e
+        """Total per-MAC SC energy at this run's stream length L (linear in L).
+
+        Carries all four measured buckets (core + conversion + Sobol + shared);
+        see the module header for why they are lumped here rather than split
+        across the peripheral/sobol_bank components.
+        """
+        return E_COMPUTE_REF_J * (self.stream_length / L_REF)
 
     def leak(self, global_cycle_seconds: float) -> float:
-        if LEAK_POWER_W is None:
-            raise EnergyNotCharacterized(
-                "sc_mac_inner.leak energy is not characterized."
-            )
-        return LEAK_POWER_W * global_cycle_seconds
+        # No separate leakage number was characterized: leakage is already folded
+        # into the per-MAC compute buckets, so charge nothing per cycle here.
+        return 0.0
 
     def get_area(self) -> float:
         area_um2 = AREA_PER_BIT_UM2 * (self.datawidth + self.mag_bits) * self._tech_scale()

@@ -12,12 +12,12 @@ a whole output row, w[v,k] a whole column) means far fewer conversions than MACs
 and better temporal reuse lowers it further. This is the term that actually moves
 the energy-optimal mapping.
 
-Energies are MEASURED ONLY -- one entry per stream length L (no interpolation).
-From a power_payn_array PT run at each SC_T:
-    E_READ_J_BY_L[L] = (u_peripheral dynamic energy) / ((N_H + N_W) * K operands)
-read() picks the entry for the run's stream length (via the SC_STREAM_LENGTH env
-var, since a storage component can't take a stream_length attribute); an unset L
-raises so an uncharacterized number can never silently reach the ERT.
+FOR NOW this estimator is ZEROED: the characterization gave the conversion cost
+only as a per-MAC bucket (0.047377 pJ/MAC @ L=128), not a per-operand-read
+number, so it is folded into sc_mac_inner.compute (see sc_mac.py header) rather
+than billed on this level's `read`. Splitting it back out here needs a per-read
+(reuse-aware) measurement -- until then, read/leak return 0 to avoid double-
+counting the value that already lives in compute.
 """
 
 from accelergy.plug_in_interface.estimator import (
@@ -33,27 +33,12 @@ import os
 REF_TECH_NM = 45.0
 AREA_PER_LANE_UM2 = 4.0   # rough estimate, maybe useful for area comarison [um^2]
 
-E_READ_J_BY_L = {
-    16: None, 32: None, 48: None, 64: None, 96: None, 128: None, 192: None,
-}
-# peripheral leakage POWER [W] -- static, so L-independent (one value).
-LEAK_POWER_W = None    # TODO
-
-
-def _current_L() -> int:
-    """The run's SC stream length. The peripheral is a *storage* component, so it
-    can't take a `stream_length` attribute (strict StorageAttributes); the driver
-    passes it via the SC_STREAM_LENGTH env var (make mapping STREAM_LEN=...)."""
-    return int(os.environ.get("SC_STREAM_LENGTH", "128"))
-
-
-class EnergyNotCharacterized(RuntimeError):
-    """Raised when a measured PrimeTime energy has not been filled in yet.
-
-    Deliberate: this plug-in has no analytical fallback, so an uncharacterized
-    number can never silently reach the ERT. Accelergy treats a raised error as
-    "this estimator cannot estimate" and will report it if nothing else can.
-    """
+# The conversion energy (0.047377 pJ/MAC @ L=128) is currently folded into
+# sc_mac_inner.compute (see sc_mac.py header): the characterization gave only a
+# per-MAC bucket, not a per-operand-read number, so it can't be billed on this
+# storage level's `read` without a reuse ratio. Zeroed here to avoid double-
+# counting until a real per-read (and dynamic/leak) split exists.
+E_READ_J = 0.0
 
 
 def _tech_nm(technology) -> float:
@@ -84,35 +69,24 @@ class Peripheral(Estimator):
 
     @actionDynamicEnergy
     def read(self) -> float:
-        """Energy to convert one operand into its stochastic stream at length L."""
-        L = _current_L()
-        e = E_READ_J_BY_L.get(L)
-        if e is None:
-            raise EnergyNotCharacterized(
-                f"peripheral.read energy for stream length L={L} is not "
-                f"characterized. Set E_READ_J_BY_L[{L}] in peripheral.py from the "
-                f"power_payn_array PT run at SC_T={L}."
-            )
-        return e
+        """Per-operand conversion energy -- folded into sc_mac_inner.compute for
+        now (see module header), so zero here to avoid double-counting."""
+        return E_READ_J
 
-    # Alias in case Timeloop bills operand delivery through this level as `write`.
+    # Aliases: whichever action Timeloop bills operand delivery through, it's the
+    # same (zeroed) conversion energy.
     @actionDynamicEnergy
     def write(self) -> float:
         return self.read()
 
-    # Required storage action; the peripheral keeps read-only operands (no
-    # accumulation), so update never actually fires -- define it for the ERT.
     @actionDynamicEnergy
     def update(self) -> float:
         return self.read()
 
     def leak(self, global_cycle_seconds: float) -> float:
-        if LEAK_POWER_W is None:
-            raise EnergyNotCharacterized(
-                "peripheral.leak energy is not characterized."
-            )
-        return LEAK_POWER_W * global_cycle_seconds
-        
+        # Leakage is lumped into the per-MAC compute buckets; nothing per cycle.
+        return 0.0
+
 
     def get_area(self) -> float:
         area_um2 = AREA_PER_LANE_UM2 * self.M * self._tech_scale()

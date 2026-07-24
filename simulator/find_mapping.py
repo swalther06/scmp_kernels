@@ -60,14 +60,26 @@ class ArchConfig:
     Timeloop's mapper searches over -- see stream_length()/cycles_per_mac_window()
     and apply_hardware_timing() below for how it folds into real cycle counts.
     """
-    p_rows: int = 4      # systolic tile rows  (spatial, output-M side)
-    p_cols: int = 4      # systolic tile cols  (spatial, output-N side)
-    n_h: int = 1         # PEs per tile, row direction (spatial, output-M side)
-    n_w: int = 1         # PEs per tile, col direction (spatial, output-N side)
-    k_depth: int = 4     # dot-product lane width per PE (reduction dim, temporal/spatial-K)
-    m_parallel: int = 1  # bitstream samples processed per lane per cycle (CFG_M)
-    mag_bits: int = 7    # magnitude precision (sets T = 2^mag_bits by default)
-    stream_length: int = 128 # SC stream length L (its own DSE axis for mixed precision)
+    # Defaults describe the characterized k8m16n8 PE (K=8, M=16, N_H=N_W=8).
+    # p_rows/p_cols replicate that PE into a larger systolic array (per-MAC energy
+    # is replication-invariant, so 1x1 == exactly the measured unit).
+    p_rows: int = 1      # systolic tile rows  (spatial, output-M side)
+    p_cols: int = 1      # systolic tile cols  (spatial, output-N side)
+    n_h: int = 8         # N_H: tiles per PE, row direction (spatial, output-M side)
+    n_w: int = 8         # N_W: tiles per PE, col direction (spatial, output-N side)
+    k_depth: int = 8     # K: dot-product lane width per PE (reduction dim, spatial-K)
+    m_parallel: int = 16 # M: bitstream samples processed per lane per cycle (CFG_M)
+    mag_bits: int = 7    # magnitude precision (sets T = 2^mag_bits = 128 by default)
+    stream_length: int = 128 # SC stream length L = L_REF (linear-scaled in the plug-in)
+    # GlobalBuffer read-bandwidth model. The buffer must sustain the array's
+    # operand demand (see glb_read_bandwidth_bits) so the PEs never stall. That
+    # bit/cycle budget is FIXED; how it's partitioned into banks x ports is a free
+    # knob, and datawidth = bandwidth / (banks * ports) follows (a fixed total
+    # bandwidth split across more/narrower banks, or fewer/wider ones).
+    glb_banks: int = 1        # SRAM banks            (splits the bandwidth row)
+    glb_ports: int = 1        # read/write ports/bank (splits the bandwidth row)
+    glb_read_bw_bits: int | None = None  # override read BW [bits/cyc]; None -> derive from array
+    glb_size_kb: float = 256.0  # REAL on-chip SRAM capacity [KB]; DETERMINES depth (not set)
 
 
 def stream_length(arch: ArchConfig) -> int:
@@ -91,6 +103,27 @@ def cycles_per_mac_window(arch: ArchConfig) -> int:
     cycle, inversely proportional to T per the .cpp file), + 1 pipeline cycle.
     """
     return stream_length(arch) // arch.m_parallel + 1
+
+
+def glb_read_bandwidth_bits(arch: ArchConfig) -> int:
+    """Required GlobalBuffer read bandwidth [bits/cycle] so the array never stalls.
+
+    From the operand-feed bound: the array pulls two operands (Inputs + Weights),
+    each `mag_bits+1` bits wide, for every parallel MAC lane
+    (k_depth x meshX x meshY), advancing `m_parallel` stream bits/cycle; one
+    operand is reused for `stream_length` cycles, so its reload rate is 1/L. Hence
+
+        BW = 2 * (mag_bits+1) * (k_depth * meshX * meshY) * m_parallel / stream_length
+
+    Explicit `glb_read_bw_bits` overrides this derived minimum.
+    """
+    if arch.glb_read_bw_bits is not None:
+        return int(arch.glb_read_bw_bits)
+    mesh_y = arch.p_rows * arch.n_h
+    mesh_x = arch.p_cols * arch.n_w
+    lanes = arch.k_depth * mesh_x * mesh_y
+    operand_bits = arch.mag_bits + 1
+    return 2 * operand_bits * lanes * arch.m_parallel // arch.stream_length
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +264,7 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
     nodes = [
         Tagged("!Container", {
             "name": "system",
-            "attributes": {"technology": QuotedStr("45nm")},
+            "attributes": {"technology": QuotedStr("22nm")},
         }),
         Tagged("!Component", {
             "name": "DRAM",
@@ -242,12 +275,44 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
         }),
     ]
     if with_glb:
+        # --- BANDWIDTH (a hard constraint, determined by the array) --------------
+        # bits/cycle the array demands so it never stalls (grows with PE mesh /
+        # k_depth / m_parallel, shrinks with L). One row-read delivers it all.
+        bw_bits = glb_read_bandwidth_bits(arch)
+        operand_bits = arch.mag_bits + 1       # datawidth = OPERAND element width
+        ppb = arch.glb_ports * arch.glb_banks
+        if ppb < 1 or bw_bits % (ppb * operand_bits):
+            raise ValueError(
+                f"GlobalBuffer bandwidth {bw_bits} bits/cyc must split into a whole "
+                f"number of {operand_bits}-bit operands per bank/port "
+                f"(glb_ports*glb_banks = {ppb}); adjust banks/ports."
+            )
+        per_bank_width = bw_bits // ppb        # row width per bank [bits]
+        read_bw_words = bw_bits // operand_bits # total words/cycle (= block_size*ppb)
+
+        # --- CAPACITY (determined by the REAL SRAM size, not set) ---------------
+        # datawidth stays the operand width so capacity accounts for real operands
+        # (capacity_operands = ppb*depth*width/datawidth = glb_size_kb*1024 bytes).
+        # depth is BACKED OUT from the physical size and the bandwidth-set row:
+        #   total_bits = glb_size_kb*1024*8 = ppb * depth * per_bank_width
+        sram_bits = int(round(arch.glb_size_kb * 1024 * 8))
+        glb_depth = max(1, sram_bits // (ppb * per_bank_width))
         nodes.append(Tagged("!Component", {
             "name": "GlobalBuffer",
             "class": "SRAM",
-            # depth/width/datawidth drive the CACTI SRAM energy model.
-            # Placeholder GLB sizing -- tune to the real on-chip buffer.
-            "attributes": {"depth": 16384, "width": 256, "datawidth": 8},
+            # width/read_bandwidth encode the array-determined bandwidth; datawidth
+            # is the operand width (correct capacity); depth is derived from the
+            # real on-chip SRAM size (glb_size_kb). (n_banks>1 capacity/bandwidth
+            # accounting is Timeloop-per-instance -- confirm with Haoran.)
+            "attributes": {
+                "depth": glb_depth,
+                "width": per_bank_width,
+                "datawidth": operand_bits,
+                "n_banks": arch.glb_banks,
+                "n_rdwr_ports": arch.glb_ports,
+                "read_bandwidth": read_bw_words,   # words/cyc; * datawidth = bw_bits
+                "write_bandwidth": read_bw_words,
+            },
         }))
     nodes += [
         # OUTER (shared): Sobol RNG banks. Carry no operand data -- just per-cycle
@@ -270,7 +335,13 @@ def build_arch_spec(arch: ArchConfig, with_glb: bool = True) -> dict[str, Any]:
             "name": "Peripheral",
             "class": "storage",
             "subclass": "peripheral",
-            "attributes": {"depth": 64, "width": 8, "datawidth": 8},
+            # Holds exactly one operand slice in flight for the array (it's a
+            # passthrough converter, not a reuse buffer): mesh_y*k_depth inputs +
+            # mesh_x*k_depth weights. Sizing it to the slice forces the mapper to
+            # keep operand reuse up in the GlobalBuffer rather than staging here,
+            # and scales with the array (the old fixed 64 fit only the 4x4 mesh).
+            "attributes": {"depth": (mesh_x + mesh_y) * arch.k_depth,
+                           "width": 8, "datawidth": 8},
             "constraints": {"dataspace": {
                 "keep": FlowList(["Inputs", "Weights"]),
                 "bypass": FlowList(["Outputs"])}},
@@ -636,15 +707,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--M", type=int, default=1024, help="GEMM M dimension")
     p.add_argument("--K", type=int, default=1024, help="GEMM K dimension")
     p.add_argument("--N", type=int, default=1024, help="GEMM N dimension")
-    p.add_argument("--p-rows", type=int, default=4, help="matches CFG_P_ROWS")
-    p.add_argument("--p-cols", type=int, default=4, help="matches CFG_P_COLS")
-    p.add_argument("--n-h", type=int, default=1, help="matches CFG_N_H")
-    p.add_argument("--n-w", type=int, default=1, help="matches CFG_N_W")
-    p.add_argument("--k-depth", type=int, default=4, help="matches CFG_K")
-    p.add_argument("--m-parallel", type=int, default=1, help="matches CFG_M")
+    p.add_argument("--p-rows", type=int, default=1, help="matches CFG_P_ROWS")
+    p.add_argument("--p-cols", type=int, default=1, help="matches CFG_P_COLS")
+    p.add_argument("--n-h", type=int, default=8, help="matches CFG_N_H (k8m16n8: N_H=8)")
+    p.add_argument("--n-w", type=int, default=8, help="matches CFG_N_W (k8m16n8: N_W=8)")
+    p.add_argument("--k-depth", type=int, default=8, help="matches CFG_K (k8m16n8: K=8)")
+    p.add_argument("--m-parallel", type=int, default=16, help="matches CFG_M (k8m16n8: M=16)")
     p.add_argument("--mag-bits", type=int, default=7, help="matches CFG_MAG_BITS")
     p.add_argument("--stream-length", type=int, default=128,
                     help="SC stream length L (mixed-precision axis; scales compute/read energy)")
+    p.add_argument("--glb-banks", type=int, default=1,
+                    help="GlobalBuffer SRAM banks (free knob; splits the fixed read bandwidth)")
+    p.add_argument("--glb-ports", type=int, default=1,
+                    help="GlobalBuffer read/write ports per bank (free knob)")
+    p.add_argument("--glb-read-bw", type=int, default=None,
+                    help="fixed GlobalBuffer read bandwidth [bits/cycle]; "
+                         "default derives the no-stall minimum from the array geometry")
+    p.add_argument("--glb-size-kb", type=float, default=256.0,
+                    help="REAL on-chip SRAM capacity [KB]; determines GlobalBuffer depth")
     p.add_argument("--work-dir", type=Path, default=Path("timeloop_workspace"),
                     help="where timeloop problem/arch/mapper YAML + outputs go")
     p.add_argument("--workload-out", type=Path, default=Path("workload.bin"),
@@ -665,6 +745,8 @@ def main() -> None:
         n_h=args.n_h, n_w=args.n_w,
         k_depth=args.k_depth, m_parallel=args.m_parallel, mag_bits=args.mag_bits,
         stream_length=args.stream_length,
+        glb_banks=args.glb_banks, glb_ports=args.glb_ports,
+        glb_read_bw_bits=args.glb_read_bw, glb_size_kb=args.glb_size_kb,
     )
 
     if args.emit_configs:

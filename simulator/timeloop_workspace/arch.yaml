@@ -9,7 +9,7 @@ architecture:
   - !Container
     name: system
     attributes:
-      technology: "45nm"
+      technology: "22nm"
   - !Component
     name: DRAM
     class: DRAM
@@ -21,9 +21,13 @@ architecture:
     name: GlobalBuffer
     class: SRAM
     attributes:
-      depth: 16384
-      width: 256
+      depth: 2048
+      width: 1024
       datawidth: 8
+      n_banks: 1
+      n_rdwr_ports: 1
+      read_bandwidth: 128
+      write_bandwidth: 128
   - !Component
     name: SobolBank
     class: storage
@@ -41,7 +45,7 @@ architecture:
     class: storage
     subclass: peripheral
     attributes:
-      depth: 64
+      depth: 128
       width: 8
       datawidth: 8
     constraints:
@@ -51,12 +55,12 @@ architecture:
   - !Container
     name: PE
     spatial:
-      meshX: 4
-      meshY: 4
+      meshX: 8
+      meshY: 8
   - !Container
     name: Klane
     spatial:
-      meshX: 4
+      meshX: 8
   - !Component
     name: MACC
     class: sc_mac_inner
